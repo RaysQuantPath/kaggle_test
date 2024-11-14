@@ -3,6 +3,7 @@ import numpy as np
 import polars as pl
 from catboost import CatBoostRegressor, Pool
 from sklearn.kernel_approximation import RBFSampler
+from sklearn.impute import SimpleImputer
 from datetime import timedelta
 import optuna
 from optuna.integration import CatBoostPruningCallback
@@ -16,40 +17,41 @@ df_list = [
 df = pl.concat(df_list)
 
 date_col = 'date_id'
-df = df.with_columns([pl.col(date_col).cast(pl.Datetime).alias(date_col)])
-df = df.sort(date_col)
+df = df.with_columns([pl.col(date_col).cast(pl.Datetime).alias(date_col)]).sort(date_col)
 
 feature_cols = [f'feature_{i:02d}' for i in range(0, 79)]
 target_col = 'responder_6'
 weight_col = 'weight'
 
-n_rff_features = 500
+X = df.select(feature_cols).to_pandas().values
+y = df.select(target_col).to_pandas()[target_col].values
+weights = df.select(weight_col).to_pandas()[weight_col].values
+dates = df.select(date_col).to_pandas()[date_col]
+
+imputer = SimpleImputer(strategy='mean')
+X_imputed = imputer.fit_transform(X)
+
 gamma = rng.choice([0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+rff = RBFSampler(gamma=gamma, n_components=500, random_state=42)
+X_rff = rff.fit_transform(X_imputed) - 0.5
 
-rff = RBFSampler(gamma=gamma, n_components=n_rff_features, random_state=42)
-
-max_date = df.select(pl.col(date_col).max()).to_numpy()[0][0]
+max_date = dates.max()
 cutoff_date = max_date - 30
-train_df = df.filter(pl.col(date_col) < cutoff_date)
-test_df = df.filter(pl.col(date_col) >= cutoff_date)
+train_mask = dates < cutoff_date
+test_mask = dates >= cutoff_date
 
-X_train_original = train_df.select(feature_cols).to_numpy()
-X_train_rff = rff.fit_transform(X_train_original)
-X_train_rff = X_train_rff - 0.5
-y_train = train_df.select(target_col).to_numpy().ravel()
-weights_train = train_df.select(weight_col).to_numpy().ravel()
+X_train = X_rff[train_mask]
+y_train = y[train_mask]
+weights_train = weights[train_mask]
 
-X_test_original = test_df.select(feature_cols).to_numpy()
-X_test_rff = rff.transform(X_test_original)
-X_test_rff = X_test_rff - 0.5
-y_test = test_df.select(target_col).to_numpy().ravel()
-weights_test = test_df.select(weight_col).to_numpy().ravel()
+X_test = X_rff[test_mask]
+y_test = y[test_mask]
+weights_test = weights[test_mask]
 
 def weighted_r2_score(y_true, y_pred, weights):
     numerator = np.sum(weights * (y_true - y_pred) ** 2)
     denominator = np.sum(weights * (y_true - np.average(y_true, weights=weights)) ** 2)
-    r2 = 1 - (numerator / denominator)
-    return r2
+    return 1 - (numerator / denominator)
 
 def objective(trial):
     params = {
@@ -59,19 +61,18 @@ def objective(trial):
         'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1e-3, 1e3, log=True),
         'loss_function': 'MAE',
         'task_type': 'GPU',
+        'random_state': 42,
     }
 
-    train_pool = Pool(data=X_train_rff, label=y_train, weight=weights_train)
-    test_pool = Pool(data=X_test_rff, label=y_test, weight=weights_test)
+    train_pool = Pool(data=X_train, label=y_train, weight=weights_train)
+    test_pool = Pool(data=X_test, label=y_test, weight=weights_test)
 
     model = CatBoostRegressor(**params, verbose=0)
-    model.fit(train_pool, eval_set=test_pool, verbose=0,
-              early_stopping_rounds=100, callbacks=[CatBoostPruningCallback(trial, 'MAE')])
+    model.fit(train_pool, eval_set=test_pool, early_stopping_rounds=100,
+              callbacks=[CatBoostPruningCallback(trial, 'MAE')])
 
-    y_pred = model.predict(X_test_rff)
-    weighted_r2 = weighted_r2_score(y_test, y_pred, weights_test)
-
-    return weighted_r2
+    y_pred = model.predict(X_test)
+    return weighted_r2_score(y_test, y_pred, weights_test)
 
 study = optuna.create_study(direction='maximize')
 study.optimize(objective, n_trials=50)
@@ -83,6 +84,13 @@ print('  Params: ')
 for key, value in trial.params.items():
     print(f'    {key}: {value}')
 
-y_pred = CatBoostRegressor(**trial.params, verbose=0).fit(Pool(data=X_train_rff, label=y_train, weight=weights_train)).predict(X_test_rff)
+best_params = trial.params
+best_params['loss_function'] = 'MAE'
+best_params['task_type'] = 'GPU'
+best_params['random_state'] = 42
+
+best_model = CatBoostRegressor(**best_params, verbose=0)
+best_model.fit(Pool(data=X_train, label=y_train, weight=weights_train))
+y_pred = best_model.predict(X_test)
 weighted_r2 = weighted_r2_score(y_test, y_pred, weights_test)
 print(f'Weighted R² Score on Test Set: {weighted_r2}')
