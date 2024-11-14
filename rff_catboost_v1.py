@@ -4,7 +4,6 @@ import polars as pl
 from catboost import CatBoostRegressor, Pool
 from sklearn.kernel_approximation import RBFSampler
 from sklearn.impute import SimpleImputer
-from datetime import timedelta
 import optuna
 from optuna.integration import CatBoostPruningCallback
 
@@ -17,8 +16,6 @@ df_list = [
 df = pl.concat(df_list)
 
 date_col = 'date_id'
-df = df.with_columns([pl.col(date_col).cast(pl.Datetime).alias(date_col)]).sort(date_col)
-
 feature_cols = [f'feature_{i:02d}' for i in range(0, 79)]
 target_col = 'responder_6'
 weight_col = 'weight'
@@ -26,7 +23,7 @@ weight_col = 'weight'
 X = df.select(feature_cols).to_pandas().values
 y = df.select(target_col).to_pandas()[target_col].values
 weights = df.select(weight_col).to_pandas()[weight_col].values
-dates = df.select(date_col).to_pandas()[date_col]
+dates = df.select(date_col).to_pandas()[date_col].values
 
 imputer = SimpleImputer(strategy='mean')
 X_imputed = imputer.fit_transform(X)
@@ -63,6 +60,11 @@ def objective(trial):
         'task_type': 'GPU',
         'random_state': 42,
     }
+
+    if X_train.shape[0] != y_train.shape[0]:
+        raise ValueError("Training data and labels do not match.")
+    if X_test.shape[0] != y_test.shape[0]:
+        raise ValueError("Test data and labels do not match.")
 
     train_pool = Pool(data=X_train, label=y_train, weight=weights_train)
     test_pool = Pool(data=X_test, label=y_test, weight=weights_test)
