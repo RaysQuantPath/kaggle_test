@@ -7,10 +7,9 @@ import xgboost as xgb
 import catboost as cbt
 from sklearn.model_selection import TimeSeriesSplit
 
-
 ROOT_DIR = './jane-street-real-time-market-data-forecasting'
 TRAIN_PATH = os.path.join(ROOT_DIR, 'train.parquet')
-TEST_PATH = os.path.join(ROOT_DIR, 'test.parquet')
+# TEST_PATH = os.path.join(ROOT_DIR, 'test.parquet')  # 不再需要外部测试集
 MODEL_DIR = './models_v2'
 MODEL_PATH = './pretrained_models'
 
@@ -18,53 +17,59 @@ os.makedirs(ROOT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(MODEL_PATH, exist_ok=True)
 
-# Check if the training and test files exist, otherwise create placeholders
-if not os.path.exists(TRAIN_PATH):
-    print(f"Training file '{TRAIN_PATH}' not found. Please place the 'train.parquet' file in '{ROOT_DIR}'.")
-    pd.DataFrame().to_parquet(TRAIN_PATH)
+# 移除外部测试集的检查
+# if not os.path.exists(TEST_PATH):
+#     print(f"Test file '{TEST_PATH}' not found. Please place the 'test.parquet' file in '{ROOT_DIR}'.")
+#     pd.DataFrame().to_parquet(TEST_PATH)
 
-if not os.path.exists(TEST_PATH):
-    print(f"Test file '{TEST_PATH}' not found. Please place the 'test.parquet' file in '{ROOT_DIR}'.")
-    pd.DataFrame().to_parquet(TEST_PATH)
-
-# Global constants
+# 全局常量
 TRAINING = True
 FEATURE_NAMES = [f"feature_{i:02d}" for i in range(79)]
-NUM_VALID_DATES = 100
+NUM_VALID_DATES = 100  # 可根据需要调整
+NUM_TEST_DATES = 30  # 使用训练集最后30天作为测试集
 SKIP_DATES = 500
 N_FOLD = 5
 
-# Load training data if in training mode
+# 加载训练数据
 if TRAINING:
     if os.path.getsize(TRAIN_PATH) > 0:
         df = pd.read_parquet(TRAIN_PATH)
         df = df[df['date_id'] >= SKIP_DATES].reset_index(drop=True)
         dates = df['date_id'].unique()
-        valid_dates = dates[-NUM_VALID_DATES:]
-        train_dates = dates[:-NUM_VALID_DATES]
-        print("Training and validation datasets prepared.")
+        test_dates = dates[-NUM_TEST_DATES:]
+        remaining_dates = dates[:-NUM_TEST_DATES]
+
+        valid_dates = remaining_dates[-NUM_VALID_DATES:] if NUM_VALID_DATES > 0 else []
+        train_dates = remaining_dates[:-NUM_VALID_DATES] if NUM_VALID_DATES > 0 else remaining_dates
+
+        print("已准备好训练、验证和测试数据集。")
     else:
-        print(f"Training file '{TRAIN_PATH}' is empty. Please provide a valid training dataset.")
+        print(f"训练文件 '{TRAIN_PATH}' 为空。请提供有效的训练数据集。")
         exit()
 
-# Define the weighted R² scoring function
+# 定义加权R²评分函数
 def weighted_r2_score(y_true, y_pred, weights):
     numerator = np.sum(weights * (y_true - y_pred) ** 2)
     denominator = np.sum(weights * (y_true - np.average(y_true, weights=weights)) ** 2)
     return 1 - (numerator / denominator)
 
-# Model training function
+# 模型训练函数
 def train(model_dict, model_name='lgb'):
     if TRAINING:
-        tscv = TimeSeriesSplit(n_splits=N_FOLD)
-        X = df[FEATURE_NAMES]
-        y = df['responder_6']
-        w = df['weight']
+        # 准备训练数据
+        train_df = df[df['date_id'].isin(train_dates)]
+        X_train_full = train_df[FEATURE_NAMES]
+        y_train_full = train_df['responder_6']
+        w_train_full = train_df['weight']
 
-        for i, (train_index, valid_index) in enumerate(tscv.split(X)):
-            X_train, X_valid = X.iloc[train_index], X.iloc[valid_index]
-            y_train, y_valid = y.iloc[train_index], y.iloc[valid_index]
-            w_train, w_valid = w.iloc[train_index], w.iloc[valid_index]
+        tscv = TimeSeriesSplit(n_splits=N_FOLD)
+        for i, (train_index, valid_index) in enumerate(tscv.split(X_train_full)):
+            X_train = X_train_full.iloc[train_index]
+            X_valid = X_train_full.iloc[valid_index]
+            y_train = y_train_full.iloc[train_index]
+            y_valid = y_train_full.iloc[valid_index]
+            w_train = w_train_full.iloc[train_index]
+            w_valid = w_train_full.iloc[valid_index]
 
             model = model_dict[model_name]
             if model_name == 'lgb':
@@ -84,26 +89,26 @@ def train(model_dict, model_name='lgb'):
                           early_stopping_rounds=100, verbose=10)
 
             joblib.dump(model, os.path.join(MODEL_DIR, f'{model_name}_{i}.model'))
-            del X_train, y_train, w_train
+            del X_train, y_train, w_train, X_valid, y_valid, w_valid
     else:
         models.append(joblib.load(os.path.join(MODEL_PATH, f'{model_name}_{i}.model')))
 
-# Model dictionary
+# 模型字典
 model_dict = {
     'lgb': lgb.LGBMRegressor(n_estimators=500, device='gpu', gpu_use_dp=True, objective='l2'),
-    'xgb': xgb.XGBRegressor(n_estimators=2000, learning_rate=0.1, max_depth=6, tree_method='hist', device="cuda",
+    'xgb': xgb.XGBRegressor(n_estimators=2000, learning_rate=0.1, max_depth=6, tree_method='hist', gpu_id=0,
                             objective='reg:squarederror'),
     'cbt': cbt.CatBoostRegressor(iterations=1000, learning_rate=0.05, task_type='GPU', loss_function='RMSE'),
 }
 
-# Train models
+# 训练模型
 models = []
 for model_name in model_dict.keys():
     train(model_dict, model_name)
 
-# Evaluate the models using the test dataset
-if os.path.getsize(TEST_PATH) > 0:
-    test_df = pd.read_parquet(TEST_PATH)
+# 使用测试集评估模型
+if TRAINING:
+    test_df = df[df['date_id'].isin(test_dates)]
     X_test = test_df[FEATURE_NAMES]
     y_test = test_df['responder_6']
     w_test = test_df['weight']
@@ -117,17 +122,17 @@ if os.path.getsize(TEST_PATH) > 0:
             model = joblib.load(model_path)
             fold_predictions.append(model.predict(X_test))
 
-        # Average predictions across folds for the current model
+        # 对当前模型的各折预测取平均值
         y_pred = np.mean(fold_predictions, axis=0)
 
-        # Calculate weighted R² score for the current model
+        # 计算加权 R² 分数
         r2_score = weighted_r2_score(y_test, y_pred, w_test)
         model_scores[model_name] = r2_score
-        print(f"Weighted R² score for {model_name}: {r2_score:.4f}")
+        print(f"{model_name} 的加权 R² 分数: {r2_score:.8f}")
 
-    # Summary of scores
-    print("\nSummary of model scores:")
+    # 分数摘要
+    print("\n模型分数摘要:")
     for model_name, score in model_scores.items():
-        print(f"{model_name}: {score:.4f}")
+        print(f"{model_name}: {score:.8f}")
 else:
-    print(f"Test file '{TEST_PATH}' is empty. Please provide a valid test dataset.")
+    print("没有可用于评估的测试数据集。")
