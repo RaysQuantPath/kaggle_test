@@ -22,6 +22,10 @@ os.makedirs(MODEL_PATH, exist_ok=True)
 # 全局常量
 TRAINING = True
 FEATURE_NAMES = [f"feature_{i:02d}" for i in range(79)]
+# NUM_VALID_DATES = 1
+# NUM_TEST_DATES = 1
+# SKIP_DATES = 1
+# N_FOLD = 5
 NUM_VALID_DATES = 90
 NUM_TEST_DATES = 90
 SKIP_DATES = 500
@@ -63,16 +67,17 @@ class LTCRNN(torch.nn.Module):
         return self.fc(hidden[-1])
 
 class LNNWrapper:
-    def __init__(self, input_dim, hidden_dim=64, batch_size=32, lr=0.001, epochs=10, device="cuda"):
+    def __init__(self, input_dim, hidden_dim=64, batch_size=32, lr=0.01, epochs=100, patience=5, device="cuda"):
         self.model = LTCRNN(input_dim=input_dim, hidden_dim=hidden_dim, device=device).to(device)
         self.device = device
         self.batch_size = batch_size
         self.lr = lr
         self.epochs = epochs
+        self.patience = patience  # 早停的耐心值
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.loss_fn = torch.nn.MSELoss(reduction='none')  # Reduction set to 'none' to apply weights manually
 
-    def fit(self, X_train, y_train, sample_weight=None):
+    def fit(self, X_train, y_train, X_valid=None, y_valid=None, sample_weight=None):
         # Convert data to PyTorch tensors
         dataset = TensorDataset(
             torch.tensor(X_train, dtype=torch.float32),
@@ -82,7 +87,11 @@ class LNNWrapper:
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
         self.model.train()
+        best_loss = float('inf')
+        no_improve_epochs = 0  # 用于记录验证集上没有改进的 epoch 数量
+
         for epoch in range(self.epochs):
+            # Training Phase
             epoch_loss = 0.0
             for X_batch, y_batch, w_batch in dataloader:
                 X_batch, y_batch, w_batch = X_batch.to(self.device), y_batch.to(self.device), w_batch.to(self.device)
@@ -100,7 +109,32 @@ class LNNWrapper:
                 self.optimizer.step()
 
                 epoch_loss += weighted_loss.item()
-            print(f"LNN Epoch {epoch + 1}/{self.epochs}, Loss: {epoch_loss:.4f}")
+
+            print(f"LNN Epoch {epoch + 1}/{self.epochs}, Training Loss: {epoch_loss:.4f}")
+
+            # Validation Phase (if validation data provided)
+            if X_valid is not None and y_valid is not None:
+                self.model.eval()
+                X_valid_tensor = torch.tensor(X_valid, dtype=torch.float32).to(self.device)
+                y_valid_tensor = torch.tensor(y_valid, dtype=torch.float32).to(self.device)
+                with torch.no_grad():
+                    valid_predictions = self.model(X_valid_tensor).squeeze(-1)
+                    valid_loss = torch.nn.functional.mse_loss(valid_predictions, y_valid_tensor, reduction='mean').item()
+
+                print(f"LNN Epoch {epoch + 1}/{self.epochs}, Validation Loss: {valid_loss:.4f}")
+
+                # Early Stopping Check
+                if valid_loss < best_loss:
+                    best_loss = valid_loss
+                    no_improve_epochs = 0
+                else:
+                    no_improve_epochs += 1
+
+                if no_improve_epochs >= self.patience:
+                    print(f"Early stopping at epoch {epoch + 1}, best validation loss: {best_loss:.4f}")
+                    break
+
+                self.model.train()  # Set back to train mode
 
     def predict(self, X_test):
         self.model.eval()
@@ -197,7 +231,7 @@ def optimize_weights(fold_predictions, y_true, w_true):
 
 # ----------------- 模型字典 -----------------
 model_dict = {
-    'lnn': LNNWrapper(input_dim=len(FEATURE_NAMES), hidden_dim=64, batch_size=32, lr=0.001, epochs=10),
+    'lnn': LNNWrapper(input_dim=len(FEATURE_NAMES), hidden_dim=64, batch_size=32, lr=0.001, epochs=100),
     'lgb': lgb.LGBMRegressor(n_estimators=500, device='gpu', gpu_use_dp=True, objective='l2'),
     'xgb': xgb.XGBRegressor(n_estimators=2000, learning_rate=0.1, max_depth=6, tree_method='hist', gpu_id=0,
                             objective='reg:squarederror'),
