@@ -8,11 +8,11 @@ import catboost as cbt
 import lightgbm as lgb
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 import copy
-import math
 import warnings
 
 # 忽略某些警告
@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore")
 # 文件路径和参数
 ROOT_DIR = r'C:\Users\cyg19\Desktop\kaggle_test'
 TRAIN_PATH = os.path.join(ROOT_DIR, 'filtered_train.parquet')
-MODEL_DIR = './models_v12'
+MODEL_DIR = './models_v10'
 MODEL_PATH = './pretrained_models'
 
 os.makedirs(ROOT_DIR, exist_ok=True)
@@ -35,6 +35,10 @@ NUM_VALID_DATES = 90
 NUM_TEST_DATES = 90
 SKIP_DATES = 500
 N_FOLD = 5
+# NUM_VALID_DATES = 1
+# NUM_TEST_DATES = 1
+# SKIP_DATES = 1
+# N_FOLD = 5
 
 # 加载训练数据
 if TRAINING:
@@ -59,50 +63,48 @@ def weighted_r2_score(y_true, y_pred, weights):
     denominator = np.sum(weights * (y_true - np.average(y_true, weights=weights)) ** 2)
     return 1 - (numerator / denominator)
 
-# ----------------- Transformer 模型 -----------------
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)  # [max_len, 1, d_model]
-        self.register_buffer("pe", pe)
+# ----------------- TCN 模型 -----------------
+class TemporalConvNet(nn.Module):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.0):
+        super(TemporalConvNet, self).__init__()
+        layers = []
+        num_levels = len(num_channels)
+        self.num_levels = num_levels
+
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = num_inputs if i == 0 else num_channels[i - 1]
+            out_channels = num_channels[i]
+
+            layers += [nn.Conv1d(in_channels, out_channels, kernel_size, stride=1, padding=(kernel_size - 1) * dilation_size, dilation=dilation_size),
+                       nn.ReLU(),
+                       nn.Dropout(dropout)]
+
+        self.network = nn.Sequential(*layers)
 
     def forward(self, x):
-        # x: [T, N, F]
-        x = x + self.pe[:x.size(0), :]
-        return x
+        return self.network(x)
 
-class TransformerModel(nn.Module):
-    def __init__(self, d_feat=79, d_model=64, nhead=4, num_layers=2, dropout=0.5):
-        super(TransformerModel, self).__init__()
-        self.feature_layer = nn.Linear(d_feat, d_model)
-        self.pos_encoder = PositionalEncoding(d_model)
-        encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        self.decoder_layer = nn.Linear(d_model, 1)
+class TCNModel(nn.Module):
+    def __init__(self, num_input, output_size, num_channels, kernel_size, dropout):
+        super().__init__()
+        self.tcn = TemporalConvNet(num_input, num_channels, kernel_size, dropout=dropout)
+        self.linear = nn.Linear(num_channels[-1], output_size)
 
-    def forward(self, src):
-        # src: [N, T, F]
-        src = self.feature_layer(src)  # [N, T, d_model]
-        src = src.transpose(1, 0)  # [T, N, d_model]
-        src = self.pos_encoder(src)  # [T, N, d_model]
-        output = self.transformer_encoder(src)  # [T, N, d_model]
-        output = self.decoder_layer(output.transpose(1, 0)[:, -1, :])  # [N, 1]
+    def forward(self, x):
+        output = self.tcn(x)
+        output = self.linear(output[:, :, -1])
         return output.squeeze()
 
-class TransformerWrapper:
-    def __init__(self, input_size, seq_len=1, d_model=64, nhead=4, num_layers=2, dropout=0.5, batch_size=32, lr=0.0001, epochs=100, patience=5, device='cuda'):
+class TCNWrapper:
+    def __init__(self, input_size, seq_len=1, n_chans=128, kernel_size=5, num_layers=2, dropout=0.0, batch_size=32, lr=0.001, epochs=100, patience=5, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.model = TransformerModel(d_feat=input_size, d_model=d_model, nhead=nhead, num_layers=num_layers, dropout=dropout).to(self.device)
+        self.model = TCNModel(num_input=input_size, output_size=1, num_channels=[n_chans]*num_layers, kernel_size=kernel_size, dropout=dropout).to(self.device)
         self.batch_size = batch_size
         self.lr = lr
         self.epochs = epochs
         self.patience = patience  # 早停的耐心值
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=1e-3)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.loss_fn = torch.nn.MSELoss(reduction='none')  # 使用 'none' 以应用样本权重
         self.seq_len = seq_len
         self.input_size = input_size
@@ -167,12 +169,12 @@ class TransformerWrapper:
         else:
             X_valid_reshaped, y_valid = None, None
 
-        # 转换为 PyTorch 张量
-        dataset = TensorDataset(
-            torch.tensor(X_train_reshaped, dtype=torch.float32),
-            torch.tensor(y_train, dtype=torch.float32),
-            torch.tensor(sample_weight if sample_weight is not None else np.ones(len(y_train)), dtype=torch.float32)
-        )
+        # 转换为 PyTorch 张量，并调整维度以匹配 TCN 输入
+        X_train_tensor = torch.tensor(X_train_reshaped, dtype=torch.float32).permute(0, 2, 1)  # [batch, input_size, seq_len]
+        y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+        w_train_tensor = torch.tensor(sample_weight if sample_weight is not None else np.ones(len(y_train)), dtype=torch.float32)
+
+        dataset = TensorDataset(X_train_tensor, y_train_tensor, w_train_tensor)
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
         self.model.train()
@@ -201,18 +203,18 @@ class TransformerWrapper:
 
                 epoch_loss += weighted_loss.item()
 
-            print(f"Transformer Epoch {epoch + 1}/{self.epochs}, Training Loss: {epoch_loss:.4f}")
+            print(f"TCN Epoch {epoch + 1}/{self.epochs}, Training Loss: {epoch_loss:.4f}")
 
             # 验证阶段（如果提供验证数据）
             if X_valid_reshaped is not None and y_valid is not None:
                 self.model.eval()
                 with torch.no_grad():
-                    X_valid_tensor = torch.tensor(X_valid_reshaped, dtype=torch.float32).to(self.device)
+                    X_valid_tensor = torch.tensor(X_valid_reshaped, dtype=torch.float32).permute(0, 2, 1).to(self.device)
                     y_valid_tensor = torch.tensor(y_valid, dtype=torch.float32).to(self.device)
                     valid_predictions = self.model(X_valid_tensor).squeeze(-1)
                     valid_loss = torch.nn.functional.mse_loss(valid_predictions, y_valid_tensor, reduction='mean').item()
 
-                print(f"Transformer Epoch {epoch + 1}/{self.epochs}, Validation Loss: {valid_loss:.4f}")
+                print(f"TCN Epoch {epoch + 1}/{self.epochs}, Validation Loss: {valid_loss:.4f}")
 
                 # 早停检查
                 if valid_loss < best_loss:
@@ -231,7 +233,7 @@ class TransformerWrapper:
         # 加载最佳参数
         if X_valid_reshaped is not None and y_valid is not None:
             self.model.load_state_dict(best_param)
-            torch.save(best_param, os.path.join(MODEL_DIR, 'transformer_best_param.pth'))
+            torch.save(best_param, os.path.join(MODEL_DIR, 'tcn_best_param.pth'))
 
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -262,8 +264,9 @@ class TransformerWrapper:
             print(f"Original shape: {X_test_scaled.shape}, Desired shape: (-1, {self.seq_len}, {self.input_size})")
             raise
 
+        # 转换为 PyTorch 张量，并调整维度以匹配 TCN 输入
+        X_test_tensor = torch.tensor(X_test_reshaped, dtype=torch.float32).permute(0, 2, 1).to(self.device)
         self.model.eval()
-        X_test_tensor = torch.tensor(X_test_reshaped, dtype=torch.float32).to(self.device)
         with torch.no_grad():
             predictions = self.model(X_test_tensor).cpu().numpy().squeeze(-1)
         return predictions
@@ -287,17 +290,11 @@ def train(model_dict, model_name='lgb'):
             model = model_dict[model_name]
             if model_name in ['lgb', 'cbt', 'xgb']:
                 if model_name == 'lgb':
-                    eval_set = [(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None
-                    eval_sample_weight = [w_valid] if NUM_VALID_DATES > 0 else None
-                    callbacks = [lgb.early_stopping(100), lgb.log_evaluation(10)] if NUM_VALID_DATES > 0 else None
                     model.fit(
-                        X_train, y_train,
-                        sample_weight=w_train,
-                        eval_set=eval_set,
-                        eval_sample_weight=eval_sample_weight,
-                        callbacks=callbacks,
-                        early_stopping_rounds=100,
-                        verbose=10
+                        X_train, y_train, sample_weight=w_train,
+                        eval_set=[(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None,
+                        eval_sample_weight=[w_valid] if NUM_VALID_DATES > 0 else None,
+                        early_stopping_rounds=100, verbose=10
                     )
                 elif model_name == 'cbt':
                     if NUM_VALID_DATES > 0:
@@ -309,17 +306,14 @@ def train(model_dict, model_name='lgb'):
                     else:
                         model.fit(X_train, y_train, sample_weight=w_train)
                 elif model_name == 'xgb':
-                    eval_set = [(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None
-                    sample_weight_eval_set = [w_valid] if NUM_VALID_DATES > 0 else None
                     model.fit(
                         X_train, y_train, sample_weight=w_train,
-                        eval_set=eval_set,
-                        sample_weight_eval_set=sample_weight_eval_set,
-                        early_stopping_rounds=100,
-                        verbose=10
+                        eval_set=[(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None,
+                        sample_weight_eval_set=[w_valid] if NUM_VALID_DATES > 0 else None,
+                        early_stopping_rounds=100, verbose=10
                     )
-            elif model_name == 'transformer':
-                # Transformer 模型训练过程
+            elif model_name == 'tcn':
+                # TCN 模型训练过程
                 model.fit(X_train, y_train, X_valid, y_valid, sample_weight=w_train)
 
             # 保存模型
@@ -337,9 +331,26 @@ def get_fold_predictions(model_names, df, dates, feature_names):
             model_path = os.path.join(MODEL_DIR, f'{model_name}_{i}.model')
             model = joblib.load(model_path)
             X = df[feature_names].loc[df['date_id'].isin(dates)].values
-            if model_name == 'transformer':
-                # Transformer 模型需要填充和标准化
-                predictions = model.predict(X)
+            if model_name == 'tcn':
+                # TCN 模型需要填充和标准化
+                X_df = pd.DataFrame(X, columns=feature_names)
+                if model.all_missing_cols:
+                    X_df[model.all_missing_cols] = 0
+                X_imputed = model.imputer.transform(X_df)
+                if model.all_missing_cols:
+                    X_imputed[:, [feature_names.index(col) for col in model.all_missing_cols]] = 0
+                X_scaled = model.scaler.transform(X_imputed)
+                try:
+                    X_reshaped = X_scaled.reshape(-1, model.seq_len, model.input_size)
+                except ValueError as e:
+                    print(f"Error reshaping X for model {model_name}_{i}: {e}")
+                    print(f"Original shape: {X_scaled.shape}, Desired shape: (-1, {model.seq_len}, {model.input_size})")
+                    raise
+                X_tensor = torch.tensor(X_reshaped, dtype=torch.float32).permute(0, 2, 1).to(model.device)
+                with torch.no_grad():
+                    self_model = model.model
+                    self_model.eval()
+                    predictions = self_model(X_tensor).cpu().numpy().squeeze(-1)
                 fold_predictions[model_name].append(predictions)
             else:
                 fold_predictions[model_name].append(model.predict(X))
@@ -369,39 +380,11 @@ def optimize_weights(fold_predictions, y_true, w_true):
 
 # ----------------- 模型字典 -----------------
 model_dict = {
-    'transformer': TransformerWrapper(
-        input_size=len(FEATURE_NAMES),
-        seq_len=1,
-        d_model=64,
-        nhead=4,
-        num_layers=2,
-        dropout=0.5,
-        batch_size=32,
-        lr=0.0001,
-        epochs=100,
-        patience=5,
-        device='cuda'
-    ),
-    'lgb': lgb.LGBMRegressor(
-        n_estimators=500,
-        device='gpu',
-        gpu_use_dp=True,
-        objective='l2'
-    ),
-    'xgb': xgb.XGBRegressor(
-        n_estimators=2000,
-        learning_rate=0.1,
-        max_depth=6,
-        tree_method='hist',
-        gpu_id=0,
-        objective='reg:squarederror'
-    ),
-    'cbt': cbt.CatBoostRegressor(
-        iterations=1000,
-        learning_rate=0.05,
-        task_type='GPU',
-        loss_function='RMSE'
-    ),
+    'tcn': TCNWrapper(input_size=len(FEATURE_NAMES), seq_len=1, n_chans=128, kernel_size=5, num_layers=2, dropout=0.0, batch_size=32, lr=0.001, epochs=100, patience=5, device='cuda'),
+    'lgb': lgb.LGBMRegressor(n_estimators=500, device='gpu', gpu_use_dp=True, objective='l2'),
+    'xgb': xgb.XGBRegressor(n_estimators=2000, learning_rate=0.1, max_depth=6, tree_method='hist', gpu_id=0,
+                            objective='reg:squarederror'),
+    'cbt': cbt.CatBoostRegressor(iterations=1000, learning_rate=0.05, task_type='GPU', loss_function='RMSE'),
 }
 
 # ----------------- 训练和测试 -----------------

@@ -13,6 +13,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 import copy
+import math
+import warnings
+
+# 忽略某些警告
+warnings.filterwarnings("ignore")
 
 # 文件路径和参数
 ROOT_DIR = r'C:\Users\cyg19\Desktop\kaggle_test'
@@ -216,8 +221,8 @@ class sLSTM(nn.Module):
 
 class XLSTMWrapper:
     def __init__(self, input_size, seq_len=1, hidden_size=64, num_layers=2, dropout=0.0, batch_size=32, lr=0.0001, epochs=100, patience=5, device='cuda'):
-        self.model = sLSTM(input_size=input_size, seq_len=seq_len, hidden_size=hidden_size, num_layers=num_layers).to(device)
-        self.device = device
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.model = sLSTM(input_size=input_size, seq_len=seq_len, hidden_size=hidden_size, num_layers=num_layers).to(self.device)
         self.batch_size = batch_size
         self.lr = lr
         self.epochs = epochs
@@ -362,14 +367,14 @@ class XLSTMWrapper:
 
         # 填充所有缺失列为0
         if self.all_missing_cols:
-            X_test_df[self.all_missing_cols] = 3
+            X_test_df[self.all_missing_cols] = 0
 
         # 对所有特征进行均值填充
         X_test_imputed = self.imputer.transform(X_test_df)
 
         # 填充所有缺失列为0（再次确保）
         if self.all_missing_cols:
-            X_test_imputed[:, [FEATURE_NAMES.index(col) for col in self.all_missing_cols]] = 3
+            X_test_imputed[:, [FEATURE_NAMES.index(col) for col in self.all_missing_cols]] = 0
 
         # 标准化数据
         X_test_scaled = self.scaler.transform(X_test_imputed)
@@ -429,7 +434,7 @@ def train(model_dict, model_name='lgb'):
                         early_stopping_rounds=100, verbose=10
                     )
             elif model_name == 'xlstm':
-
+                # XLSTM 模型训练过程
                 model.fit(X_train, y_train, X_valid, y_valid, sample_weight=w_train)
 
             # 保存模型
@@ -449,12 +454,24 @@ def get_fold_predictions(model_names, df, dates, feature_names):
             X = df[feature_names].loc[df['date_id'].isin(dates)].values
             if model_name == 'xlstm':
                 # XLSTM 模型需要填充和标准化
-                # 假设模型已经包含了 imputer 和 scaler
-                X = model.imputer.transform(pd.DataFrame(X, columns=feature_names))
+                X_df = pd.DataFrame(X, columns=feature_names)
                 if model.all_missing_cols:
-                    X[:, [feature_names.index(col) for col in model.all_missing_cols]] = 0
-                X = model.scaler.transform(X)
-            fold_predictions[model_name].append(model.predict(X))
+                    X_df[model.all_missing_cols] = 0
+                X_imputed = model.imputer.transform(X_df)
+                if model.all_missing_cols:
+                    X_imputed[:, [feature_names.index(col) for col in model.all_missing_cols]] = 0
+                X_scaled = model.scaler.transform(X_imputed)
+                try:
+                    X_reshaped = X_scaled.reshape(-1, model.seq_len, model.input_size)
+                except ValueError as e:
+                    print(f"Error reshaping X for model {model_name}_{i}: {e}")
+                    print(f"Original shape: {X_scaled.shape}, Desired shape: (-1, {model.seq_len}, {model.input_size})")
+                    raise
+                with torch.no_grad():
+                    predictions = model.predict(X_scaled)  # 使用修正后的 predict 方法
+                fold_predictions[model_name].append(predictions)
+            else:
+                fold_predictions[model_name].append(model.predict(X))
 
     return fold_predictions
 
