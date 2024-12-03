@@ -415,14 +415,14 @@ def train(model_dict, model_name='lgb'):
                     model.fit(
                         X_train, y_train, sample_weight=w_train,
                         eval_set=[(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None,
-                        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(10)] if NUM_VALID_DATES > 0 else None
+                        callbacks=[lgb.early_stopping(200), lgb.log_evaluation(10)] if NUM_VALID_DATES > 0 else None
                     )
                 elif model_name == 'cbt':
                     if NUM_VALID_DATES > 0:
                         evalset = cbt.Pool(X_valid, y_valid, weight=w_valid)
                         model.fit(
                             X_train, y_train, sample_weight=w_train,
-                            eval_set=[evalset], early_stopping_rounds=100, verbose=10
+                            eval_set=[evalset], early_stopping_rounds=200, verbose=10
                         )
                     else:
                         model.fit(X_train, y_train, sample_weight=w_train)
@@ -431,7 +431,7 @@ def train(model_dict, model_name='lgb'):
                         X_train, y_train, sample_weight=w_train,
                         eval_set=[(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None,
                         sample_weight_eval_set=[w_valid] if NUM_VALID_DATES > 0 else None,
-                        early_stopping_rounds=100, verbose=10
+                        early_stopping_rounds=200, verbose=10
                     )
             elif model_name == 'xlstm':
                 # XLSTM 模型训练过程
@@ -498,11 +498,11 @@ def optimize_weights(fold_predictions, y_true, w_true):
 
 # ----------------- 模型字典 -----------------
 model_dict = {
-    'xlstm': XLSTMWrapper(input_size=len(FEATURE_NAMES), seq_len=1, hidden_size=64, num_layers=2, batch_size=32, lr=0.0001, epochs=100, patience=5, device='cuda'),
-    'lgb': lgb.LGBMRegressor(n_estimators=500, device='gpu', gpu_use_dp=True, objective='l2'),
-    'xgb': xgb.XGBRegressor(n_estimators=2000, learning_rate=0.1, max_depth=6, tree_method='hist', gpu_id=0,
+    'xlstm': XLSTMWrapper(input_size=len(FEATURE_NAMES), seq_len=1, hidden_size=64, num_layers=2, batch_size=32, lr=0.001, epochs=100, patience=5, device='cuda'),
+    'lgb': lgb.LGBMRegressor(n_estimators=5000, device='gpu', gpu_use_dp=True, objective='l2'),
+    'xgb': xgb.XGBRegressor(n_estimators=5000, learning_rate=0.1, max_depth=6, tree_method='hist', gpu_id=0,
                             objective='reg:squarederror'),
-    'cbt': cbt.CatBoostRegressor(iterations=1000, learning_rate=0.05, task_type='GPU', loss_function='RMSE'),
+    'cbt': cbt.CatBoostRegressor(iterations=5000, learning_rate=0.05, task_type='GPU', loss_function='RMSE'),
 }
 
 # ----------------- 训练和测试 -----------------

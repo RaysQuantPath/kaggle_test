@@ -416,39 +416,28 @@ def train(model_dict, model_name='lgb'):
                 X_valid, y_valid, w_valid = None, None, None
 
             model = model_dict[model_name]
-            if model_name in ['lgb', 'cbt', 'xgb']:
-                if model_name == 'lgb':
-                    eval_set = [(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None
-                    eval_sample_weight = [w_valid] if NUM_VALID_DATES > 0 else None
-                    callbacks = [lgb.early_stopping(100), lgb.log_evaluation(10)] if NUM_VALID_DATES > 0 else None
-                    model.fit(
-                        X_train, y_train,
-                        sample_weight=w_train,
-                        eval_set=eval_set,
-                        eval_sample_weight=eval_sample_weight,
-                        callbacks=callbacks,
-                        early_stopping_rounds=100,
-                        verbose=10
-                    )
-                elif model_name == 'cbt':
-                    if NUM_VALID_DATES > 0:
-                        evalset = cbt.Pool(X_valid, y_valid, weight=w_valid)
-                        model.fit(
-                            X_train, y_train, sample_weight=w_train,
-                            eval_set=[evalset], early_stopping_rounds=100, verbose=10
-                        )
-                    else:
-                        model.fit(X_train, y_train, sample_weight=w_train)
-                elif model_name == 'xgb':
-                    eval_set = [(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None
-                    sample_weight_eval_set = [w_valid] if NUM_VALID_DATES > 0 else None
+            if model_name == 'lgb':
+                model.fit(
+                    X_train, y_train, sample_weight=w_train,
+                    eval_set=[(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None,
+                    callbacks=[lgb.early_stopping(200), lgb.log_evaluation(10)] if NUM_VALID_DATES > 0 else None
+                )
+            elif model_name == 'cbt':
+                if NUM_VALID_DATES > 0:
+                    evalset = cbt.Pool(X_valid, y_valid, weight=w_valid)
                     model.fit(
                         X_train, y_train, sample_weight=w_train,
-                        eval_set=eval_set,
-                        sample_weight_eval_set=sample_weight_eval_set,
-                        early_stopping_rounds=100,
-                        verbose=10
+                        eval_set=[evalset], early_stopping_rounds=200, verbose=10
                     )
+                else:
+                    model.fit(X_train, y_train, sample_weight=w_train)
+            elif model_name == 'xgb':
+                model.fit(
+                    X_train, y_train, sample_weight=w_train,
+                    eval_set=[(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None,
+                    sample_weight_eval_set=[w_valid] if NUM_VALID_DATES > 0 else None,
+                    early_stopping_rounds=200, verbose=10
+                )
             elif model_name == 'sfm':
                 # SFM 模型训练过程
                 model.fit(X_train, y_train, X_valid, y_valid, sample_weight=w_train)
@@ -513,13 +502,13 @@ model_dict = {
         device='cuda'
     ),
     'lgb': lgb.LGBMRegressor(
-        n_estimators=500,
+        n_estimators=5000,
         device='gpu',
         gpu_use_dp=True,
         objective='l2'
     ),
     'xgb': xgb.XGBRegressor(
-        n_estimators=2000,
+        n_estimators=5000,
         learning_rate=0.1,
         max_depth=6,
         tree_method='hist',
@@ -527,7 +516,7 @@ model_dict = {
         objective='reg:squarederror'
     ),
     'cbt': cbt.CatBoostRegressor(
-        iterations=1000,
+        iterations=5000,
         learning_rate=0.05,
         task_type='GPU',
         loss_function='RMSE'

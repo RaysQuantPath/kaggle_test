@@ -112,7 +112,7 @@ class LNNWrapper:
 # ----------------- 模型调参使用 Optuna -----------------
 def optimize_lgb(trial, X_train, y_train, X_valid, y_valid, w_train, w_valid):
     params = {
-        'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+        'n_estimators': trial.suggest_int('n_estimators', 100, 5000),
         'learning_rate': trial.suggest_float('learning_rate', 1e-4, 0.1, log=True),
         'max_depth': trial.suggest_int('max_depth', 3, 15),
         'num_leaves': trial.suggest_int('num_leaves', 10, 100),
@@ -122,13 +122,13 @@ def optimize_lgb(trial, X_train, y_train, X_valid, y_valid, w_train, w_valid):
     }
     model = lgb.LGBMRegressor(**params)
     model.fit(X_train, y_train, sample_weight=w_train, eval_set=[(X_valid, y_valid)],
-              callbacks=[lgb.early_stopping(50)])
+              callbacks=[lgb.early_stopping(200)])
     y_pred = model.predict(X_valid)
     return -weighted_r2_score(y_valid, y_pred, w_valid)  # 负值，因为 Optuna 最小化目标
 
 def optimize_xgb(trial, X_train, y_train, X_valid, y_valid, w_train, w_valid):
     params = {
-        'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+        'n_estimators': trial.suggest_int('n_estimators', 100, 5000),
         'learning_rate': trial.suggest_float('learning_rate', 1e-4, 0.3, log=True),
         'max_depth': trial.suggest_int('max_depth', 3, 15),
         'subsample': trial.suggest_uniform('subsample', 0.5, 1.0),
@@ -139,13 +139,13 @@ def optimize_xgb(trial, X_train, y_train, X_valid, y_valid, w_train, w_valid):
     }
     model = xgb.XGBRegressor(**params)
     model.fit(X_train, y_train, sample_weight=w_train, eval_set=[(X_valid, y_valid)],
-              early_stopping_rounds=50, verbose=False)
+              early_stopping_rounds=200, verbose=False)
     y_pred = model.predict(X_valid)
     return -weighted_r2_score(y_valid, y_pred, w_valid)
 
 def optimize_cbt(trial, X_train, y_train, X_valid, y_valid, w_train, w_valid):
     params = {
-        'iterations': trial.suggest_int('iterations', 500, 2000),
+        'iterations': trial.suggest_int('iterations', 500, 5000),
         'learning_rate': trial.suggest_float('learning_rate', 1e-4, 0.3, log=True),
         'depth': trial.suggest_int('depth', 4, 10),
         'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1e-4, 10, log=True),
@@ -154,7 +154,7 @@ def optimize_cbt(trial, X_train, y_train, X_valid, y_valid, w_train, w_valid):
     }
     model = cbt.CatBoostRegressor(**params)
     model.fit(X_train, y_train, sample_weight=w_train, eval_set=[(X_valid, y_valid)],
-              early_stopping_rounds=50, verbose=False)
+              early_stopping_rounds=200, verbose=False)
     y_pred = model.predict(X_valid)
     return -weighted_r2_score(y_valid, y_pred, w_valid)
 
@@ -196,14 +196,14 @@ def train(model_dict, model_name='lgb'):
                 model.fit(
                     X_train, y_train, sample_weight=w_train,
                     eval_set=[(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None,
-                    callbacks=[lgb.early_stopping(100), lgb.log_evaluation(10)] if NUM_VALID_DATES > 0 else None
+                    callbacks=[lgb.early_stopping(200), lgb.log_evaluation(10)] if NUM_VALID_DATES > 0 else None
                 )
             elif model_name == 'cbt':
                 if NUM_VALID_DATES > 0:
                     evalset = cbt.Pool(X_valid, y_valid, weight=w_valid)
                     model.fit(
                         X_train, y_train, sample_weight=w_train,
-                        eval_set=[evalset], early_stopping_rounds=100, verbose=10
+                        eval_set=[evalset], early_stopping_rounds=200, verbose=10
                     )
                 else:
                     model.fit(X_train, y_train, sample_weight=w_train)
@@ -212,7 +212,7 @@ def train(model_dict, model_name='lgb'):
                     X_train, y_train, sample_weight=w_train,
                     eval_set=[(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None,
                     sample_weight_eval_set=[w_valid] if NUM_VALID_DATES > 0 else None,
-                    early_stopping_rounds=100, verbose=10
+                    early_stopping_rounds=200, verbose=10
                 )
             elif model_name == 'lnn':
                 # LNN 模型训练过程
