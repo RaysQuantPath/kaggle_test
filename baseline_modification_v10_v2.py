@@ -10,6 +10,8 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 from deap import base, creator, tools, algorithms
 import copy
+from joblib import Parallel, delayed
+import multiprocessing
 
 # ----------------- 文件路径和参数 -----------------
 ROOT_DIR = r'C:\Users\cyg19\Desktop\kaggle_test'
@@ -186,44 +188,67 @@ class LNNWrapper:
 
 # ----------------- 序列生成函数 -----------------
 def create_sequences_with_padding(df, feature_names, sequence_length, symbol_id_to_index):
-    """
-    创建序列数据，并在序列开始部分进行前向填充。
-    """
-    sequences = []
-    targets = []
-    weights = []
-    symbol_ids_seq = []
-
-    for symbol_id, group in df.groupby('symbol_id'):
+    def process_group(symbol_id, group, feature_names, sequence_length, symbol_id_to_index):
         group = group.sort_values('date_id').reset_index(drop=True)
         group_features = group[feature_names].values
         group_targets = group['responder_6'].values
         group_weights = group['weight'].values
+        n = len(group_features)
+        sequences = []
+        targets = []
+        weights = []
+        symbol_ids_seq = []
+        pad_count = sequence_length - 1
+        if pad_count > 0:
+            pad_seq = np.tile(group_features[0], (pad_count, sequence_length, 1))
+            pad_target = np.full(pad_count, group_targets[0])
+            pad_weight = np.full(pad_count, group_weights[0])
+            pad_symbol_id = np.full(pad_count, symbol_id_to_index[symbol_id])
+            sequences.append(pad_seq)
+            targets.append(pad_target)
+            weights.append(pad_weight)
+            symbol_ids_seq.append(pad_symbol_id)
+        if n >= sequence_length:
+            try:
+                normal_seqs = np.lib.stride_tricks.sliding_window_view(group_features, window_shape=sequence_length, axis=0)
+            except AttributeError:
+                normal_seqs = np.array([group_features[i:i + sequence_length] for i in range(n - sequence_length + 1)])
+            normal_targets = group_targets[sequence_length - 1:]
+            normal_weights = group_weights[sequence_length - 1:]
+            normal_symbol_id = np.full(n - sequence_length + 1, symbol_id_to_index[symbol_id])
+            sequences.append(normal_seqs)
+            targets.append(normal_targets)
+            weights.append(normal_weights)
+            symbol_ids_seq.append(normal_symbol_id)
+        return sequences, targets, weights, symbol_ids_seq
 
-        # 前向填充：用第一个样本填充前 sequence_length -1 个序列
-        for i in range(sequence_length - 1):
-            seq = np.tile(group_features[0], (sequence_length, 1))  # 复制第一个样本
-            target = group_targets[0]  # 使用第一个目标
-            weight = group_weights[0]  # 使用第一个权重
-            sequences.append(seq)
-            targets.append(target)
-            weights.append(weight)
-            symbol_ids_seq.append(symbol_id)  # 直接使用映射后的 symbol_id
-
-        # 正常生成序列
-        for i in range(len(group) - sequence_length + 1):
-            seq = group_features[i:i + sequence_length]
-            target = group_targets[i + sequence_length - 1]
-            weight = group_weights[i + sequence_length - 1]
-            sequences.append(seq)
-            targets.append(target)
-            weights.append(weight)
-            symbol_ids_seq.append(symbol_id)  # 直接使用映射后的 symbol_id
-
-    X = np.array(sequences)
-    y = np.array(targets)
-    w = np.array(weights)
-    symbol_ids_seq = np.array(symbol_ids_seq)
+    df = df.sort_values(['symbol_id', 'date_id']).reset_index(drop=True)
+    grouped = df.groupby('symbol_id')
+    num_cores = multiprocessing.cpu_count()
+    results = Parallel(n_jobs=num_cores)(
+        delayed(process_group)(symbol_id, group, feature_names, sequence_length, symbol_id_to_index)
+        for symbol_id, group in grouped
+    )
+    all_sequences = []
+    all_targets = []
+    all_weights = []
+    all_symbol_ids_seq = []
+    for sequences, targets, weights, symbol_ids_seq in results:
+        if sequences:
+            all_sequences.append(np.concatenate(sequences, axis=0))
+            all_targets.append(np.concatenate(targets, axis=0))
+            all_weights.append(np.concatenate(weights, axis=0))
+            all_symbol_ids_seq.append(np.concatenate(symbol_ids_seq, axis=0))
+    if all_sequences:
+        X = np.concatenate(all_sequences, axis=0)
+        y = np.concatenate(all_targets, axis=0)
+        w = np.concatenate(all_weights, axis=0)
+        symbol_ids_seq = np.concatenate(all_symbol_ids_seq, axis=0)
+    else:
+        X = np.empty((0, sequence_length, len(feature_names)))
+        y = np.empty((0,))
+        w = np.empty((0,))
+        symbol_ids_seq = np.empty((0,), dtype=int)
     return X, y, w, symbol_ids_seq
 
 # ----------------- 模型训练函数 -----------------
