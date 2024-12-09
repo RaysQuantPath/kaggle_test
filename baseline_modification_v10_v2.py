@@ -29,7 +29,7 @@ NUM_VALID_DATES = 100
 NUM_TEST_DATES = 90
 SKIP_DATES = 500
 N_FOLD = 5
-SEQUENCE_LENGTH = 5
+SEQUENCE_LENGTH = 7
 
 # ----------------- 加载和预处理数据 -----------------
 if TRAINING:

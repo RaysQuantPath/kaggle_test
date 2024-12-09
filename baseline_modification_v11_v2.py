@@ -37,7 +37,7 @@ NUM_VALID_DATES = 100
 NUM_TEST_DATES = 90
 SKIP_DATES = 500
 N_FOLD = 5
-SEQUENCE_LENGTH = 5  # 您可以根据需要调整序列长度
+SEQUENCE_LENGTH = 7  # 您可以根据需要调整序列长度
 
 # 加载训练数据
 if TRAINING:
