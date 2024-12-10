@@ -31,7 +31,7 @@ NUM_VALID_DATES = 100
 NUM_TEST_DATES = 90
 SKIP_DATES = 500
 N_FOLD = 5
-SEQUENCE_LENGTH = 7
+SEQUENCE_LENGTH = 5
 
 def reduce_mem_usage(self, float16_as32=True):
     #memory_usage()是df每列的内存使用量,sum是对它们求和, B->KB->MB
