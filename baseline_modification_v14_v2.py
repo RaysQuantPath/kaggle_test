@@ -2,23 +2,21 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
+import random
 import xgboost as xgb
 import catboost as cbt
 import lightgbm as lgb
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
+from deap import base, creator, tools, algorithms
 import copy
-import math
-import warnings
+from joblib import Parallel, delayed
+import numba
+import multiprocessing
+from tqdm import tqdm
 
-# 忽略某些警告
-warnings.filterwarnings("ignore")
 
-# 文件路径和参数
+# ----------------- 文件路径和参数 -----------------
 ROOT_DIR = r'C:\Users\cyg19\Desktop\kaggle_test'
 TRAIN_PATH = os.path.join(ROOT_DIR, 'filtered_train.parquet')
 MODEL_DIR = './models_v14_v2'
@@ -30,16 +28,52 @@ os.makedirs(MODEL_PATH, exist_ok=True)
 
 # 全局常量
 TRAINING = True
-FEATURE_NAMES = [f"feature_{i:02d}" for i in range(79)]
-NUM_VALID_DATES = 90
+FEATURE_NAMES_XLSTM = [f"feature_{i:02d}" for i in range(79)]
+FEATURE_NAMES_OTHER = [f"feature_{i:02d}" for i in range(79)] + ['symbol_id']
+NUM_VALID_DATES = 100
 NUM_TEST_DATES = 90
 SKIP_DATES = 500
 N_FOLD = 5
+SEQUENCE_LENGTH = 5
 
-# 加载训练数据
+
+def reduce_mem_usage(df, float16_as32=True):
+    start_mem = df.memory_usage().sum() / 1024**2
+    print('Memory usage of dataframe is {:.2f} MB'.format(start_mem))
+
+    for col in df.columns:
+        col_type = df[col].dtype
+        if col_type != object and str(col_type)!='category':
+            c_min,c_max = df[col].min(),df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)
+            else:
+                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                    if float16_as32:
+                        df[col] = df[col].astype(np.float32)
+                    else:
+                        df[col] = df[col].astype(np.float16)
+                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+    end_mem = df.memory_usage().sum() / 1024**2
+    print('Memory usage after optimization is: {:.2f} MB'.format(end_mem))
+    print('Decreased by {:.1f}%'.format(100 * (start_mem - end_mem) / start_mem))
+    return df
+
+# ----------------- 加载和预处理数据 -----------------
 if TRAINING:
     if os.path.getsize(TRAIN_PATH) > 0:
         df = pd.read_parquet(TRAIN_PATH)
+        df = reduce_mem_usage(df, False)
         df = df[df['date_id'] >= SKIP_DATES].reset_index(drop=True)
         dates = df['date_id'].unique()
         test_dates = dates[-NUM_TEST_DATES:]
@@ -48,101 +82,189 @@ if TRAINING:
         valid_dates = remaining_dates[-NUM_VALID_DATES:] if NUM_VALID_DATES > 0 else []
         train_dates = remaining_dates[:-NUM_VALID_DATES] if NUM_VALID_DATES > 0 else remaining_dates
 
-        # 新增：处理 symbol_id
+        # 处理 symbol_id
         symbol_ids = df['symbol_id'].unique()
-        num_symbols = len(symbol_ids)
         symbol_id_to_index = {symbol_id: idx for idx, symbol_id in enumerate(symbol_ids)}
+        df['symbol_id'] = df['symbol_id'].map(symbol_id_to_index)
+        num_symbols = len(symbol_ids)
 
         print("已准备好训练、验证和测试数据集。")
     else:
         print(f"训练文件 '{TRAIN_PATH}' 为空。请提供有效的训练数据集。")
         exit()
 
-# 定义加权 R² 评分函数
+# ----------------- 定义加权 R² 评分函数 -----------------
 def weighted_r2_score(y_true, y_pred, weights):
     numerator = np.sum(weights * (y_true - y_pred) ** 2)
     denominator = np.sum(weights * (y_true - np.average(y_true, weights=weights)) ** 2)
     return 1 - (numerator / denominator)
 
-# ----------------- SFM 模型 -----------------
+# ----------------- 序列生成函数 -----------------
+def create_sequences_with_padding(df, feature_names, sequence_length, symbol_id_to_index):
+    @numba.njit(parallel=True, fastmath=True)
+    def build_sequences_numba(group_features, sequence_length):
+        n, feature_num = group_features.shape
+        out_len = n - sequence_length + 1
+        sequences = np.empty((out_len, sequence_length, feature_num), dtype=group_features.dtype)
+        for i in numba.prange(out_len):
+            for j in range(sequence_length):
+                sequences[i, j, :] = group_features[i + j]
+        return sequences
+
+    def process_group(symbol_id, group, feature_names, sequence_length, symbol_id_to_index):
+        group_features = group[feature_names].values
+        group_targets = group['responder_6'].values
+        group_weights = group['weight'].values
+        n = len(group_features)
+
+        if n == 0:
+            return [], [], [], []
+
+        sequences = []
+        targets = []
+        weights = []
+        symbol_ids_seq = []
+        pad_count = sequence_length - 1
+        feature_num = group_features.shape[1]
+
+        if pad_count > 0:
+            pad_seq = np.tile(group_features[0].reshape(1, 1, feature_num), (pad_count, sequence_length, 1))
+            pad_target = np.full(pad_count, group_targets[0])
+            pad_weight = np.full(pad_count, group_weights[0])
+            pad_symbol_id = np.full(pad_count, symbol_id_to_index[symbol_id])
+            sequences.append(pad_seq)
+            targets.append(pad_target)
+            weights.append(pad_weight)
+            symbol_ids_seq.append(pad_symbol_id)
+
+        if n >= sequence_length:
+            normal_seqs = build_sequences_numba(group_features, sequence_length)
+            normal_targets = group_targets[sequence_length - 1:]
+            normal_weights = group_weights[sequence_length - 1:]
+            normal_symbol_id = np.full(n - sequence_length + 1, symbol_id_to_index[symbol_id])
+
+            sequences.append(normal_seqs)
+            targets.append(normal_targets)
+            weights.append(normal_weights)
+            symbol_ids_seq.append(normal_symbol_id)
+
+        return sequences, targets, weights, symbol_ids_seq
+
+    # 将 groupby 结果转换为列表，便于tqdm显示进度
+    grouped_items = list(df.groupby('symbol_id'))
+    num_cores = multiprocessing.cpu_count() - 1
+
+    # 使用tqdm显示进度条
+    results = Parallel(n_jobs=num_cores)(
+        delayed(process_group)(symbol_id, group, feature_names, sequence_length, symbol_id_to_index)
+        for symbol_id, group in tqdm(grouped_items, desc='Processing sequences')
+    )
+
+    all_sequences = []
+    all_targets = []
+    all_weights = []
+    all_symbol_ids_seq = []
+
+    for sequences, targets, weights, symbol_ids_seq in results:
+        if sequences:
+            all_sequences.append(np.concatenate(sequences, axis=0))
+            all_targets.append(np.concatenate(targets, axis=0))
+            all_weights.append(np.concatenate(weights, axis=0))
+            all_symbol_ids_seq.append(np.concatenate(symbol_ids_seq, axis=0))
+
+    if all_sequences:
+        X = np.concatenate(all_sequences, axis=0)
+        y = np.concatenate(all_targets, axis=0)
+        w = np.concatenate(all_weights, axis=0)
+        symbol_ids_seq = np.concatenate(all_symbol_ids_seq, axis=0)
+    else:
+        X = np.empty((0, sequence_length, len(feature_names)))
+        y = np.empty((0,))
+        w = np.empty((0,))
+        symbol_ids_seq = np.empty((0,), dtype=int)
+
+    return X, y, w, symbol_ids_seq
+# ----------------- 优化权重（使用遗传算法）的辅助函数 -----------------
+def clip_individual(individual, min_val=0.0, max_val=1.0):
+    for i in range(len(individual)):
+        if individual[i] < min_val:
+            individual[i] = min_val
+        elif individual[i] > max_val:
+            individual[i] = max_val
+
+def mate_and_clip(ind1, ind2, alpha=0.5):
+    offspring1, offspring2 = tools.cxBlend(ind1, ind2, alpha)
+    clip_individual(offspring1)
+    clip_individual(offspring2)
+    return offspring1, offspring2
+
+def mutate_and_clip(individual, eta=20.0, indpb=1.0):
+    tools.mutPolynomialBounded(individual, eta=eta, low=0.0, up=1.0, indpb=indpb)
+    clip_individual(individual)
+    return (individual,)
+
+# ----------------- 替换 LNN 模型为 SFM 模型 -----------------
+import torch.nn as nn
+import torch.nn.init as init
+
 class SFM_Model(nn.Module):
     def __init__(
         self,
         d_feat=79,
-        output_dim=1,
         freq_dim=10,
         hidden_size=64,
-        dropout_W=0.0,
-        dropout_U=0.0,
-        device="cpu",
         num_symbols=1,
+        device="cuda"
     ):
-        super().__init__()
-
+        super(SFM_Model, self).__init__()
         self.input_dim = d_feat
-        self.output_dim = output_dim
+        self.output_dim = 1
         self.freq_dim = freq_dim
         self.hidden_dim = hidden_size
-        self.device = device
-        self.num_symbols = num_symbols
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
 
-        self.W_i = nn.Parameter(torch.empty((self.input_dim, self.hidden_dim)))
-        nn.init.xavier_uniform_(self.W_i)
-        self.U_i = nn.Parameter(torch.empty(self.hidden_dim, self.hidden_dim))
-        nn.init.orthogonal_(self.U_i)
+        self.W_i = nn.Parameter(init.xavier_uniform_(torch.empty((self.input_dim, self.hidden_dim))))
+        self.U_i = nn.Parameter(init.orthogonal_(torch.empty(self.hidden_dim, self.hidden_dim)))
         self.b_i = nn.Parameter(torch.zeros(self.hidden_dim))
 
-        self.W_ste = nn.Parameter(torch.empty(self.input_dim, self.hidden_dim))
-        nn.init.xavier_uniform_(self.W_ste)
-        self.U_ste = nn.Parameter(torch.empty(self.hidden_dim, self.hidden_dim))
-        nn.init.orthogonal_(self.U_ste)
+        self.W_ste = nn.Parameter(init.xavier_uniform_(torch.empty(self.input_dim, self.hidden_dim)))
+        self.U_ste = nn.Parameter(init.orthogonal_(torch.empty(self.hidden_dim, self.hidden_dim)))
         self.b_ste = nn.Parameter(torch.ones(self.hidden_dim))
 
-        self.W_fre = nn.Parameter(torch.empty(self.input_dim, self.freq_dim))
-        nn.init.xavier_uniform_(self.W_fre)
-        self.U_fre = nn.Parameter(torch.empty(self.hidden_dim, self.freq_dim))
-        nn.init.orthogonal_(self.U_fre)
+        self.W_fre = nn.Parameter(init.xavier_uniform_(torch.empty(self.input_dim, self.freq_dim)))
+        self.U_fre = nn.Parameter(init.orthogonal_(torch.empty(self.hidden_dim, self.freq_dim)))
         self.b_fre = nn.Parameter(torch.ones(self.freq_dim))
 
-        self.W_c = nn.Parameter(torch.empty(self.input_dim, self.hidden_dim))
-        nn.init.xavier_uniform_(self.W_c)
-        self.U_c = nn.Parameter(torch.empty(self.hidden_dim, self.hidden_dim))
-        nn.init.orthogonal_(self.U_c)
+        self.W_c = nn.Parameter(init.xavier_uniform_(torch.empty(self.input_dim, self.hidden_dim)))
+        self.U_c = nn.Parameter(init.orthogonal_(torch.empty(self.hidden_dim, self.hidden_dim)))
         self.b_c = nn.Parameter(torch.zeros(self.hidden_dim))
 
-        self.W_o = nn.Parameter(torch.empty(self.input_dim, self.hidden_dim))
-        nn.init.xavier_uniform_(self.W_o)
-        self.U_o = nn.Parameter(torch.empty(self.hidden_dim, self.hidden_dim))
-        nn.init.orthogonal_(self.U_o)
+        self.W_o = nn.Parameter(init.xavier_uniform_(torch.empty(self.input_dim, self.hidden_dim)))
+        self.U_o = nn.Parameter(init.orthogonal_(torch.empty(self.hidden_dim, self.hidden_dim)))
         self.b_o = nn.Parameter(torch.zeros(self.hidden_dim))
 
-        self.U_a = nn.Parameter(torch.empty(self.freq_dim, 1))
-        nn.init.orthogonal_(self.U_a)
+        self.U_a = nn.Parameter(init.orthogonal_(torch.empty(self.freq_dim, 1)))
         self.b_a = nn.Parameter(torch.zeros(self.hidden_dim))
 
-        self.W_p = nn.Parameter(torch.empty(self.hidden_dim, self.output_dim * self.num_symbols))
-        nn.init.xavier_uniform_(self.W_p)
-        self.b_p = nn.Parameter(torch.zeros(self.output_dim * self.num_symbols))
+        # 最终映射到 num_symbols 个输出
+        self.W_symbols = nn.Linear(self.hidden_dim, num_symbols)
 
         self.activation = nn.Tanh()
         self.inner_activation = nn.Hardsigmoid()
-        self.dropout_W, self.dropout_U = (dropout_W, dropout_U)
-
-        self.fc_out = nn.Linear(self.output_dim * self.num_symbols, self.num_symbols)
-
         self.states = []
+        self.to(self.device)
 
     def forward(self, input):
-        input = input.reshape(len(input), self.input_dim, -1)  # [N, F, T]
-        input = input.permute(0, 2, 1)  # [N, T, F]
+        input = input.reshape(len(input), self.input_dim, -1)  # (N, F, T)
+        input = input.permute(0, 2, 1)  # (N, T, F)
         time_step = input.shape[1]
 
         for ts in range(time_step):
             x = input[:, ts, :]
-            if len(self.states) == 0:  # hasn't initialized yet
+            if len(self.states) == 0:
                 self.init_states(x)
             self.get_constants(x)
-            p_tm1 = self.states[0]  # noqa: F841
+            p_tm1 = self.states[0]
             h_tm1 = self.states[1]
             S_re_tm1 = self.states[2]
             S_im_tm1 = self.states[3]
@@ -165,13 +287,10 @@ class SFM_Model(nn.Module):
             fre = torch.reshape(fre, (-1, 1, self.freq_dim))
 
             f = ste * fre
-
             c = i * self.activation(x_c + torch.matmul(h_tm1 * B_U[0], self.U_c))
 
             time = time_tm1 + 1
-
-            omega = torch.tensor(2 * np.pi).to(self.device) * time * frequency
-
+            omega = (torch.tensor(2 * np.pi, dtype=torch.float32, device=self.device) * time * frequency).float()
             re = torch.cos(omega)
             im = torch.sin(omega)
 
@@ -181,187 +300,86 @@ class SFM_Model(nn.Module):
             S_im = f * S_im_tm1 + c * im
 
             A = torch.square(S_re) + torch.square(S_im)
-
-            A = torch.reshape(A, (-1, self.freq_dim)).float()
+            A = torch.reshape(A, (-1, self.freq_dim))
             A_a = torch.matmul(A * B_U[0], self.U_a)
             A_a = torch.reshape(A_a, (-1, self.hidden_dim))
             a = self.activation(A_a + self.b_a)
 
             o = self.inner_activation(x_o + torch.matmul(h_tm1 * B_U[0], self.U_o))
-
             h = o * a
-            p = torch.matmul(h, self.W_p) + self.b_p
+            self.states = [None, h, S_re, S_im, time, None, None, None]
 
-            self.states = [p, h, S_re, S_im, time, None, None, None]
+        predictions = self.W_symbols(h)  # (N, num_symbols)
         self.states = []
-
-        output = self.fc_out(p)  # 输出维度为 (batch_size, num_symbols)
-        return output  # 返回所有 symbol 的预测
+        return predictions
 
     def init_states(self, x):
-        batch_size = x.size(0)
-        init_state_h = torch.zeros(batch_size, self.hidden_dim).to(self.device)
-        init_state_p = torch.zeros(batch_size, self.output_dim * self.num_symbols).to(self.device)
-
-        init_state = torch.zeros(batch_size, self.hidden_dim).to(self.device)
-        init_freq = torch.zeros(batch_size, self.freq_dim).to(self.device)
-
+        reducer_f = torch.zeros((self.hidden_dim, self.freq_dim)).to(self.device)
+        init_state_h = torch.zeros(self.hidden_dim).to(self.device)
+        init_state = torch.zeros_like(init_state_h).to(self.device)
+        init_freq = torch.matmul(init_state_h, reducer_f)
         init_state = torch.reshape(init_state, (-1, self.hidden_dim, 1))
         init_freq = torch.reshape(init_freq, (-1, 1, self.freq_dim))
-
         init_state_S_re = init_state * init_freq
         init_state_S_im = init_state * init_freq
-
-        init_state_time = torch.tensor(0).to(self.device)
-
-        self.states = [
-            init_state_p,
-            init_state_h,
-            init_state_S_re,
-            init_state_S_im,
-            init_state_time,
-            None,
-            None,
-            None,
-        ]
+        init_state_time = torch.tensor(0, dtype=torch.float32, device=self.device)
+        self.states = [None, init_state_h, init_state_S_re, init_state_S_im, init_state_time, None, None, None]
 
     def get_constants(self, x):
         constants = []
-        constants.append([torch.tensor(1.0).to(self.device) for _ in range(6)])
-        constants.append([torch.tensor(1.0).to(self.device) for _ in range(7)])
-        array = np.array([float(ii) / self.freq_dim for ii in range(self.freq_dim)])
-        constants.append(torch.tensor(array).to(self.device))
-
+        constants.append([torch.tensor(1.0, dtype=torch.float32, device=self.device) for _ in range(6)])
+        constants.append([torch.tensor(1.0, dtype=torch.float32, device=self.device) for _ in range(7)])
+        array = np.array([float(ii) / self.freq_dim for ii in range(self.freq_dim)], dtype=np.float32)
+        constants.append(torch.tensor(array, dtype=torch.float32, device=self.device))
         self.states[5:] = constants
 
 class SFMWrapper:
-    def __init__(
-        self,
-        input_size,
-        output_dim=1,
-        freq_dim=10,
-        hidden_size=64,
-        dropout_W=0.0,
-        dropout_U=0.0,
-        batch_size=32,
-        lr=0.0001,
-        epochs=100,
-        patience=5,
-        device='cuda',
-        num_symbols=1,
-    ):
+    def __init__(self, input_dim, num_symbols, hidden_dim=64, freq_dim=10, batch_size=32, lr=0.001, epochs=100, patience=5, device="cuda"):
+        self.model = SFM_Model(d_feat=input_dim, freq_dim=freq_dim, hidden_size=hidden_dim, num_symbols=num_symbols, device=device)
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.model = SFM_Model(
-            d_feat=input_size,
-            output_dim=output_dim,
-            freq_dim=freq_dim,
-            hidden_size=hidden_size,
-            dropout_W=dropout_W,
-            dropout_U=dropout_U,
-            device=self.device,
-            num_symbols=num_symbols,
-        ).to(self.device)
         self.batch_size = batch_size
         self.lr = lr
         self.epochs = epochs
-        self.patience = patience  # 早停的耐心值
+        self.patience = patience
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        self.loss_fn = torch.nn.MSELoss(reduction='none')  # 使用 'none' 以应用样本权重
-        self.input_size = input_size
+        self.loss_fn = torch.nn.MSELoss(reduction='none')
 
-        # 添加数据预处理器
-        self.imputer = SimpleImputer(strategy='mean')
-        self.scaler = StandardScaler()
-        self.all_missing_cols = []  # 存储所有缺失的列
+    def fit(self, X_train, y_train, symbol_id_train, sample_weight=None, X_valid=None, y_valid=None, symbol_id_valid=None):
+        X_train = np.nan_to_num(X_train, nan=3.0)
+        y_train = np.nan_to_num(y_train, nan=3.0)
+        if X_valid is not None and y_valid is not None:
+            X_valid = np.nan_to_num(X_valid, nan=3.0)
+            y_valid = np.nan_to_num(y_valid, nan=3.0)
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state['device'] = state['device'].type
-        return state
-
-    def __setstate__(self, state):
-        device_str = state.pop('device')
-        state['device'] = torch.device(device_str)
-        self.__dict__.update(state)
-
-    def fit(self, X_train, y_train, symbol_id_train, X_valid=None, y_valid=None, symbol_id_valid=None, sample_weight=None):
-        # 转换为 DataFrame 以便处理
-        X_train_df = pd.DataFrame(X_train, columns=FEATURE_NAMES)
-        X_valid_df = pd.DataFrame(X_valid, columns=FEATURE_NAMES) if X_valid is not None else None
-
-        # 识别所有值缺失的列
-        self.all_missing_cols = X_train_df.columns[X_train_df.isna().all()].tolist()
-
-        # 填充这些列为0
-        if self.all_missing_cols:
-            X_train_df[self.all_missing_cols] = 0
-            if X_valid_df is not None:
-                X_valid_df[self.all_missing_cols] = 0
-
-        # 对所有特征进行均值填充
-        X_train_imputed = self.imputer.fit_transform(X_train_df)
-        if X_valid_df is not None:
-            X_valid_imputed = self.imputer.transform(X_valid_df)
-        else:
-            X_valid_imputed = None
-
-        # 标准化数据
-        X_train_scaled = self.scaler.fit_transform(X_train_imputed)
-        if X_valid_imputed is not None:
-            X_valid_scaled = self.scaler.transform(X_valid_imputed)
-        else:
-            X_valid_scaled = None
-
-        y_train = y_train.reshape(-1)
-
-        if X_valid_scaled is not None:
-            y_valid = y_valid.reshape(-1)
-        else:
-            y_valid = None
-
-        # 将 symbol_id 转换为张量
-        symbol_id_tensor = torch.tensor(symbol_id_train, dtype=torch.long)
-        if symbol_id_valid is not None:
-            symbol_id_valid_tensor = torch.tensor(symbol_id_valid, dtype=torch.long)
-
-        # 转换为 PyTorch 张量
         dataset = TensorDataset(
-            torch.tensor(X_train_scaled, dtype=torch.float32),
+            torch.tensor(X_train, dtype=torch.float32),
             torch.tensor(y_train, dtype=torch.float32),
-            torch.tensor(sample_weight if sample_weight is not None else np.ones(len(y_train)), dtype=torch.float32),
-            symbol_id_tensor
+            torch.tensor(symbol_id_train, dtype=torch.long),
+            torch.tensor(sample_weight if sample_weight is not None else np.ones(len(y_train)), dtype=torch.float32)
         )
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
         self.model.train()
         best_loss = float('inf')
-        no_improve_epochs = 0  # 用于记录验证集上没有改进的 epoch 数量
+        no_improve_epochs = 0
         best_param = copy.deepcopy(self.model.state_dict())
 
         for epoch in range(self.epochs):
             epoch_loss = 0.0
-            for X_batch, y_batch, w_batch, symbol_id_batch in dataloader:
-                X_batch, y_batch, w_batch, symbol_id_batch = (
-                    X_batch.to(self.device),
-                    y_batch.to(self.device),
-                    w_batch.to(self.device),
-                    symbol_id_batch.to(self.device)
-                )
+
+            # 使用tqdm包裹dataloader，显示batch处理进度
+            for X_batch, y_batch, symbol_batch, w_batch in tqdm(dataloader, desc=f"Training Epoch {epoch+1}/{self.epochs}", leave=False):
+                X_batch = X_batch.to(self.device)
+                y_batch = y_batch.to(self.device)
+                symbol_batch = symbol_batch.to(self.device)
+                w_batch = w_batch.to(self.device)
                 self.optimizer.zero_grad()
 
-                # 前向传播
-                predictions = self.model(X_batch)  # (batch_size, num_symbols)
-
-                # 选择对应的 symbol_id 的预测
-                predictions_selected = predictions.gather(1, symbol_id_batch.unsqueeze(1)).squeeze(1)
-
-                # 计算加权损失
+                predictions = self.model(X_batch)
+                predictions_selected = predictions.gather(1, symbol_batch.unsqueeze(1)).squeeze(1)
                 loss = self.loss_fn(predictions_selected, y_batch)
-                weighted_loss = (loss * w_batch).mean()  # 应用样本权重
-
-                # 反向传播和优化
+                weighted_loss = (loss * w_batch).mean()
                 weighted_loss.backward()
-                # 添加梯度裁剪
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
@@ -369,20 +387,17 @@ class SFMWrapper:
 
             print(f"SFM Epoch {epoch + 1}/{self.epochs}, Training Loss: {epoch_loss:.4f}")
 
-            # 验证阶段（如果提供验证数据）
-            if X_valid_scaled is not None and y_valid is not None:
+            if X_valid is not None and y_valid is not None:
                 self.model.eval()
                 with torch.no_grad():
-                    X_valid_tensor = torch.tensor(X_valid_scaled, dtype=torch.float32).to(self.device)
+                    X_valid_tensor = torch.tensor(X_valid, dtype=torch.float32).to(self.device)
                     y_valid_tensor = torch.tensor(y_valid, dtype=torch.float32).to(self.device)
-                    symbol_id_valid_tensor = symbol_id_valid_tensor.to(self.device)
-                    valid_predictions = self.model(X_valid_tensor)  # (batch_size, num_symbols)
-                    valid_predictions_selected = valid_predictions.gather(1, symbol_id_valid_tensor.unsqueeze(1)).squeeze(1)
+                    symbol_valid_tensor = torch.tensor(symbol_id_valid, dtype=torch.long).to(self.device)
+                    valid_predictions = self.model(X_valid_tensor)
+                    valid_predictions_selected = valid_predictions.gather(1, symbol_valid_tensor.unsqueeze(1)).squeeze(1)
                     valid_loss = torch.nn.functional.mse_loss(valid_predictions_selected, y_valid_tensor, reduction='mean').item()
 
                 print(f"SFM Epoch {epoch + 1}/{self.epochs}, Validation Loss: {valid_loss:.4f}")
-
-                # 早停检查
                 if valid_loss < best_loss:
                     best_loss = valid_loss
                     no_improve_epochs = 0
@@ -394,151 +409,170 @@ class SFMWrapper:
                     print(f"Early stopping at epoch {epoch + 1}, best validation loss: {best_loss:.4f}")
                     break
 
-                self.model.train()  # 恢复训练模式
+                self.model.train()
 
-        # 加载最佳参数
-        if X_valid_scaled is not None and y_valid is not None:
+        if X_valid is not None and y_valid is not None:
             self.model.load_state_dict(best_param)
             torch.save(best_param, os.path.join(MODEL_DIR, 'sfm_best_param.pth'))
 
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
-    def predict(self, X_test, symbol_id_test):
-        # 转换为 DataFrame 以便处理
-        X_test_df = pd.DataFrame(X_test, columns=FEATURE_NAMES)
-
-        # 填充所有缺失列为0
-        if self.all_missing_cols:
-            X_test_df[self.all_missing_cols] = 0
-
-        # 对所有特征进行均值填充
-        X_test_imputed = self.imputer.transform(X_test_df)
-
-        # 标准化数据
-        X_test_scaled = self.scaler.transform(X_test_imputed)
-
-        self.model.eval()
-        X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32).to(self.device)
-        symbol_id_tensor = torch.tensor([symbol_id_to_index[sid] for sid in symbol_id_test], dtype=torch.long).to(self.device)
-
-        with torch.no_grad():
-            predictions = self.model(X_test_tensor)  # (num_samples, num_symbols)
-            predictions_selected = predictions.gather(1, symbol_id_tensor.unsqueeze(1)).cpu().numpy().squeeze(1)
-        return predictions_selected
-
 # ----------------- 模型训练函数 -----------------
 def train(model_dict, model_name='lgb'):
     for i in range(N_FOLD):
         if TRAINING:
             selected_dates = [date for ii, date in enumerate(train_dates) if ii % N_FOLD != i]
-            X_train = df[FEATURE_NAMES].loc[df['date_id'].isin(selected_dates)].values
-            y_train = df['responder_6'].loc[df['date_id'].isin(selected_dates)].values
-            w_train = df['weight'].loc[df['date_id'].isin(selected_dates)].values
-            symbol_id_train = df['symbol_id'].loc[df['date_id'].isin(selected_dates)].values
-            symbol_id_train = np.array([symbol_id_to_index[sid] for sid in symbol_id_train])
+            train_df = df[df['date_id'].isin(selected_dates)]
+
+            X_train, y_train, w_train, symbol_id_train = create_sequences_with_padding(
+                train_df, FEATURE_NAMES_XLSTM, SEQUENCE_LENGTH, symbol_id_to_index
+            )
 
             if NUM_VALID_DATES > 0:
-                X_valid = df[FEATURE_NAMES].loc[df['date_id'].isin(valid_dates)].values
-                y_valid = df['responder_6'].loc[df['date_id'].isin(valid_dates)].values
-                w_valid = df['weight'].loc[df['date_id'].isin(valid_dates)].values
-                symbol_id_valid = df['symbol_id'].loc[df['date_id'].isin(valid_dates)].values
-                symbol_id_valid = np.array([symbol_id_to_index[sid] for sid in symbol_id_valid])
+                valid_df = df[df['date_id'].isin(valid_dates)]
+                X_valid, y_valid, w_valid, symbol_id_valid = create_sequences_with_padding(
+                    valid_df, FEATURE_NAMES_XLSTM, SEQUENCE_LENGTH, symbol_id_to_index
+                )
             else:
                 X_valid, y_valid, w_valid, symbol_id_valid = None, None, None, None
 
             model = model_dict[model_name]
-            if model_name == 'sfm':
-                # SFM 模型训练过程
-                model.fit(X_train, y_train, symbol_id_train, X_valid, y_valid, symbol_id_valid, sample_weight=w_train)
-            else:
-                # 对于其他模型，将 symbol_id 作为特征
-                X_train = np.hstack((X_train, symbol_id_train.reshape(-1, 1)))
+            if model_name in ['lgb', 'xgb', 'cbt']:
+                X_train_last = X_train[:, -1, :]
+                X_train_other = np.hstack((X_train_last, symbol_id_train.reshape(-1, 1)))
                 if X_valid is not None:
-                    X_valid = np.hstack((X_valid, symbol_id_valid.reshape(-1, 1)))
-                model.fit(
-                    X_train, y_train, sample_weight=w_train,
-                    eval_set=[(X_valid, y_valid)] if NUM_VALID_DATES > 0 else None,
-                    early_stopping_rounds=200, verbose=10
+                    X_valid_last = X_valid[:, -1, :]
+                    X_valid_other = np.hstack((X_valid_last, symbol_id_valid.reshape(-1, 1)))
+                else:
+                    X_valid_other = None
+
+                if model_name == 'lgb':
+                    model.fit(
+                        X_train_other, y_train, sample_weight=w_train,
+                        eval_set=[(X_valid_other, y_valid)] if NUM_VALID_DATES > 0 else None,
+                        callbacks=[lgb.early_stopping(200), lgb.log_evaluation(10)] if NUM_VALID_DATES > 0 else None
+                    )
+                elif model_name == 'cbt':
+                    if NUM_VALID_DATES > 0:
+                        evalset = cbt.Pool(X_valid_other, y_valid, weight=w_valid)
+                        model.fit(
+                            X_train_other, y_train, sample_weight=w_train,
+                            eval_set=[evalset], early_stopping_rounds=200, verbose=10
+                        )
+                    else:
+                        model.fit(X_train_other, y_train, sample_weight=w_train)
+                elif model_name == 'xgb':
+                    model.fit(
+                        X_train_other, y_train, sample_weight=w_train,
+                        eval_set=[(X_valid_other, y_valid)] if NUM_VALID_DATES > 0 else None,
+                        sample_weight_eval_set=[w_valid] if NUM_VALID_DATES > 0 else None,
+                        early_stopping_rounds=200, verbose=10
+                    )
+            elif model_name == 'sfm':
+                # SFM模型是序列模型，直接使用原来的X_train, y_train等
+                self_model = model
+                self_model.fit(
+                    X_train, y_train, symbol_id_train, sample_weight=w_train,
+                    X_valid=X_valid, y_valid=y_valid, symbol_id_valid=symbol_id_valid
                 )
 
-            # 保存模型
             joblib.dump(model, os.path.join(MODEL_DIR, f'{model_name}_{i}.model'))
-            del X_train, y_train, w_train, X_valid, y_valid, w_valid, symbol_id_train, symbol_id_valid
-        else:
-            models.append(joblib.load(os.path.join(MODEL_PATH, f'{model_name}_{i}.model')))
+            del X_train, y_train, w_train, symbol_id_train, X_valid, y_valid, w_valid, symbol_id_valid
 
-# 收集模型的各折预测
-def get_fold_predictions(model_names, df, dates, feature_names):
+# ----------------- 收集模型的各折预测 -----------------
+def get_fold_predictions(model_names, test_df, feature_names_xlstm, feature_names_other, symbol_id_to_index, sequence_length):
     fold_predictions = {model_name: [] for model_name in model_names}
+    X_test_xlstm, y_test, w_test, symbol_id_test = create_sequences_with_padding(
+        test_df, feature_names_xlstm, sequence_length, symbol_id_to_index
+    )
+    X_test_last = X_test_xlstm[:, -1, :]
+    X_test_other = np.hstack((X_test_last, symbol_id_test.reshape(-1, 1)))
 
     for model_name in model_names:
         for i in range(N_FOLD):
             model_path = os.path.join(MODEL_DIR, f'{model_name}_{i}.model')
             model = joblib.load(model_path)
-            X = df[feature_names].loc[df['date_id'].isin(dates)].values
-            symbol_id = df['symbol_id'].loc[df['date_id'].isin(dates)].values
-            symbol_id = np.array([symbol_id_to_index[sid] for sid in symbol_id])
-
             if model_name == 'sfm':
-                predictions = model.predict(X, symbol_id)
+                predictions = model.predict(X_test_xlstm, symbol_id_test)
                 fold_predictions[model_name].append(predictions)
             else:
-                # 对于其他模型，将 symbol_id 作为特征
-                X = np.hstack((X, symbol_id.reshape(-1, 1)))
-                predictions = model.predict(X)
+                predictions = model.predict(X_test_other)
                 fold_predictions[model_name].append(predictions)
 
-    return fold_predictions
+    return fold_predictions, y_test, w_test
 
-# 计算加权平均的预测
 def ensemble_predictions(weights, fold_predictions):
-    y_pred = np.zeros_like(fold_predictions[next(iter(fold_predictions))][0])
+    y_pred = None
     for idx, model_name in enumerate(fold_predictions):
-        avg_pred = np.mean(fold_predictions[model_name], axis=0)
-        y_pred += weights[idx] * avg_pred
+        preds = fold_predictions[model_name]
+        avg_pred = np.mean(preds, axis=0)
+        avg_pred = avg_pred.squeeze()
+        if y_pred is None:
+            y_pred = weights[idx] * avg_pred
+        else:
+            y_pred += weights[idx] * avg_pred
     return y_pred
 
-# 优化权重
-def optimize_weights(fold_predictions, y_true, w_true):
-    def loss_function(weights):
-        weights = np.array(weights)
+def optimize_weights_genetic_algorithm(fold_predictions, y_true, w_true, population_size=50, generations=50):
+    model_names = list(fold_predictions.keys())
+    num_models = len(model_names)
+
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    creator.create("Individual", list, fitness=creator.FitnessMax)
+    toolbox = base.Toolbox()
+
+    toolbox.register("attr_float", random.uniform, 0.0, 1.0)
+    toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_float, n=num_models)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+    def eval_weights(individual):
+        weights = np.array(individual)
         weights /= weights.sum()
         y_pred = ensemble_predictions(weights, fold_predictions)
-        return -weighted_r2_score(y_true, y_pred, w_true)
+        score = weighted_r2_score(y_true, y_pred, w_true)
+        return (score,)
 
-    initial_weights = [1 / len(fold_predictions)] * len(fold_predictions)
-    bounds = [(0, 1)] * len(fold_predictions)
-    result = minimize(loss_function, initial_weights, bounds=bounds, method='SLSQP')
-    return result.x / result.x.sum()
+    toolbox.register("evaluate", eval_weights)
+    toolbox.register("mate", mate_and_clip, alpha=0.5)
+    toolbox.register("mutate", mutate_and_clip, eta=20.0, indpb=1.0 / num_models)
+    toolbox.register("select", tools.selTournament, tournsize=3)
 
-# ----------------- 模型字典 -----------------
+    pop = toolbox.population(n=population_size)
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("max", np.max)
+    stats.register("avg", np.mean)
+
+    pop, logbook = algorithms.eaSimple(pop, toolbox, cxpb=0.7, mutpb=0.2, ngen=generations, stats=stats, verbose=False)
+    top_individuals = tools.selBest(pop, k=1)
+    best_weights = np.array(top_individuals[0])
+    best_weights /= best_weights.sum()
+    best_score = top_individuals[0].fitness.values[0]
+
+    del creator.FitnessMax
+    del creator.Individual
+
+    return best_weights, best_score
+
+# ----------------- 模型字典定义 -----------------
 model_dict = {
     'sfm': SFMWrapper(
-        input_size=len(FEATURE_NAMES),
-        output_dim=1,
+        input_dim=len(FEATURE_NAMES_XLSTM),
+        num_symbols=num_symbols,
+        hidden_dim=64,
         freq_dim=10,
-        hidden_size=64,
-        dropout_W=0.0,
-        dropout_U=0.0,
-        batch_size=32,
-        lr=0.0001,
+        batch_size=1024,
+        lr=0.001,
         epochs=100,
         patience=5,
-        device='cuda',
-        num_symbols=num_symbols
+        device='cuda'
     ),
-    'lgb': lgb.LGBMRegressor(
-        n_estimators=5000,
-        device='gpu',
-        gpu_use_dp=True,
-        objective='l2'
-    ),
+    'lgb': lgb.LGBMRegressor(n_estimators=5000, device='gpu', gpu_use_dp=True, objective='l2'),
     'xgb': xgb.XGBRegressor(
         n_estimators=5000,
         learning_rate=0.1,
         max_depth=6,
-        tree_method='hist',
+        tree_method='gpu_hist',
         gpu_id=0,
         objective='reg:squarederror'
     ),
@@ -550,26 +584,28 @@ model_dict = {
     ),
 }
 
-# ----------------- 训练和测试 -----------------
+# ----------------- 训练和测试流程 -----------------
 models = []
 for model_name in model_dict.keys():
     train(model_dict, model_name)
 
-# 使用测试集评估
+num_models = len(model_dict.keys())
+
 if TRAINING:
     test_df = df[df['date_id'].isin(test_dates)]
-    X_test = test_df[FEATURE_NAMES].values
-    y_test = test_df['responder_6'].values
-    w_test = test_df['weight'].values
-    symbol_id_test = test_df['symbol_id'].values
-    symbol_id_test = np.array([symbol_id_to_index[sid] for sid in symbol_id_test])
-
     model_names = list(model_dict.keys())
-    fold_predictions = get_fold_predictions(model_names, df, test_dates, FEATURE_NAMES)
+    fold_predictions, y_test, w_test = get_fold_predictions(
+        model_names, test_df, FEATURE_NAMES_XLSTM, FEATURE_NAMES_OTHER, symbol_id_to_index, SEQUENCE_LENGTH
+    )
 
-    optimized_weights = optimize_weights(fold_predictions, y_test, w_test)
+    sample_counts = {model_name: [pred.shape[0] for pred in preds] for model_name, preds in fold_predictions.items()}
+    print("各模型预测样本数量：", sample_counts)
+    counts = [preds[0].shape[0] for preds in fold_predictions.values()]
+    if not all(count == counts[0] for count in counts):
+        raise ValueError("不同模型的预测样本数量不一致。")
 
-    # 计算各个模型的分数
+    optimized_weights, ensemble_r2_score = optimize_weights_genetic_algorithm(fold_predictions, y_test, w_test)
+
     model_scores = {}
     for model_name in model_names:
         avg_pred = np.mean(fold_predictions[model_name], axis=0)
