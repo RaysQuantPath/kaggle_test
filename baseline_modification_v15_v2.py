@@ -26,7 +26,6 @@ os.makedirs(ROOT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(MODEL_PATH, exist_ok=True)
 
-# 全局常量
 TRAINING = True
 FEATURE_NAMES_XLSTM = [f"feature_{i:02d}" for i in range(79)]
 FEATURE_NAMES_OTHER = [f"feature_{i:02d}" for i in range(79)] + ['symbol_id']
@@ -69,7 +68,6 @@ def reduce_mem_usage(df, float16_as32=True):
     print('Decreased by {:.1f}%'.format(100 * (start_mem - end_mem) / start_mem))
     return df
 
-# ----------------- 加载和预处理数据 -----------------
 if TRAINING:
     if os.path.getsize(TRAIN_PATH) > 0:
         df = pd.read_parquet(TRAIN_PATH)
@@ -82,7 +80,6 @@ if TRAINING:
         valid_dates = remaining_dates[-NUM_VALID_DATES:] if NUM_VALID_DATES > 0 else []
         train_dates = remaining_dates[:-NUM_VALID_DATES] if NUM_VALID_DATES > 0 else remaining_dates
 
-        # 处理 symbol_id
         symbol_ids = df['symbol_id'].unique()
         symbol_id_to_index = {symbol_id: idx for idx, symbol_id in enumerate(symbol_ids)}
         df['symbol_id'] = df['symbol_id'].map(symbol_id_to_index)
@@ -93,13 +90,11 @@ if TRAINING:
         print(f"训练文件 '{TRAIN_PATH}' 为空。请提供有效的训练数据集。")
         exit()
 
-# ----------------- 定义加权 R² 评分函数 -----------------
 def weighted_r2_score(y_true, y_pred, weights):
     numerator = np.sum(weights * (y_true - y_pred) ** 2)
     denominator = np.sum(weights * (y_true - np.average(y_true, weights=weights)) ** 2)
     return 1 - (numerator / denominator)
 
-# ----------------- 序列生成函数 -----------------
 def create_sequences_with_padding(df, feature_names, sequence_length, symbol_id_to_index):
     @numba.njit(parallel=True, fastmath=True)
     def build_sequences_numba(group_features, sequence_length):
@@ -152,7 +147,6 @@ def create_sequences_with_padding(df, feature_names, sequence_length, symbol_id_
 
     grouped_items = list(df.groupby('symbol_id'))
     num_cores = multiprocessing.cpu_count() - 1
-    # num_cores = 1
     results = Parallel(n_jobs=num_cores)(
         delayed(process_group)(symbol_id, group, feature_names, sequence_length, symbol_id_to_index)
         for symbol_id, group in tqdm(grouped_items, desc='Processing sequences')
@@ -201,7 +195,6 @@ def mutate_and_clip(individual, eta=20.0, indpb=1.0):
     clip_individual(individual)
     return (individual,)
 
-# ----------------- 定义 ALSTM 模型（参考给定脚本，不导入，直接定义） -----------------
 class ALSTM_Model(nn.Module):
     def __init__(self, d_feat=79, hidden_size=64, num_layers=2, dropout=0.0, device='cuda'):
         super(ALSTM_Model, self).__init__()
@@ -228,7 +221,6 @@ class ALSTM_Model(nn.Module):
         self.to(self.device)
 
     def forward(self, x):
-        # x: [batch, seq_len, input_size]
         x = self.fc_in(x)
         x = self.act(x)
         rnn_out, _ = self.rnn(x)  # [batch, seq_len, hid_size]
@@ -274,10 +266,8 @@ class ALSTMWrapper:
         no_improve_epochs = 0
         best_param = copy.deepcopy(self.model.state_dict())
 
-        # 使用 tqdm 为 epoch 添加进度条
         for epoch in tqdm(range(self.epochs), desc='ALSTM Training Epochs'):
             epoch_loss = 0.0
-            # 使用 tqdm 为 batch 添加进度条
             for X_batch, y_batch, symbol_batch, w_batch in tqdm(dataloader, desc=f"Epoch {epoch + 1}/{self.epochs}", leave=False):
                 X_batch = X_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
@@ -285,7 +275,6 @@ class ALSTMWrapper:
                 self.optimizer.zero_grad()
 
                 predictions = self.model(X_batch)
-                # 不对 symbol_id 做单独映射，ALSTM此处为单输出
                 loss = self.loss_fn(predictions, y_batch)
                 weighted_loss = (loss * w_batch).mean()
                 weighted_loss.backward()
@@ -333,7 +322,6 @@ class ALSTMWrapper:
             predictions = predictions.cpu().numpy()
         return predictions
 
-# ----------------- 模型训练函数 -----------------
 def train(model_dict, model_name='lgb'):
     for i in range(N_FOLD):
         if TRAINING:
@@ -385,7 +373,6 @@ def train(model_dict, model_name='lgb'):
                         early_stopping_rounds=200, verbose=10
                     )
             elif model_name == 'alstm':
-                # 使用 ALSTM模型序列直接fit
                 self_model = model
                 self_model.fit(
                     X_train, y_train, symbol_id_train, sample_weight=w_train,
@@ -395,7 +382,6 @@ def train(model_dict, model_name='lgb'):
             joblib.dump(model, os.path.join(MODEL_DIR, f'{model_name}_{i}.model'))
             del X_train, y_train, w_train, symbol_id_train, X_valid, y_valid, w_valid, symbol_id_valid
 
-# ----------------- 收集模型的各折预测 -----------------
 def get_fold_predictions(model_names, test_df, feature_names_xlstm, feature_names_other, symbol_id_to_index, sequence_length):
     fold_predictions = {model_name: [] for model_name in model_names}
     X_test_xlstm, y_test, w_test, symbol_id_test = create_sequences_with_padding(
@@ -458,12 +444,7 @@ def optimize_weights_genetic_algorithm(fold_predictions, y_true, w_true, populat
     stats.register("max", np.max)
     stats.register("avg", np.mean)
 
-    # 使用 tqdm 监控遗传算法的进度
-    pop, logbook = algorithms.eaSimple(
-        pop, toolbox, cxpb=0.7, mutpb=0.2, ngen=generations,
-        stats=stats, verbose=False
-    )
-
+    pop, logbook = algorithms.eaSimple(pop, toolbox, cxpb=0.7, mutpb=0.2, ngen=generations, stats=stats, verbose=False)
     top_individuals = tools.selBest(pop, k=1)
     best_weights = np.array(top_individuals[0])
     best_weights /= best_weights.sum()
@@ -474,7 +455,6 @@ def optimize_weights_genetic_algorithm(fold_predictions, y_true, w_true, populat
 
     return best_weights, best_score
 
-# ----------------- 模型字典定义 -----------------
 model_dict = {
     'alstm': ALSTMWrapper(
         input_dim=len(FEATURE_NAMES_XLSTM),
@@ -505,7 +485,6 @@ model_dict = {
     ),
 }
 
-# ----------------- 训练和测试流程 -----------------
 models = []
 for model_name in model_dict.keys():
     train(model_dict, model_name)

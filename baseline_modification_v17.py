@@ -16,7 +16,6 @@ import multiprocessing
 from tqdm import tqdm
 import torch.nn as nn
 
-
 # ----------------- 文件路径和参数 -----------------
 ROOT_DIR = r'C:\Users\cyg19\Desktop\kaggle_test'
 TRAIN_PATH = os.path.join(ROOT_DIR, 'filtered_train.parquet')
@@ -27,7 +26,6 @@ os.makedirs(ROOT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(MODEL_PATH, exist_ok=True)
 
-# 全局常量
 TRAINING = True
 FEATURE_NAMES_XLSTM = [f"feature_{i:02d}" for i in range(79)]
 FEATURE_NAMES_OTHER = [f"feature_{i:02d}" for i in range(79)] + ['symbol_id']
@@ -69,7 +67,6 @@ def reduce_mem_usage(df, float16_as32=True):
     print('Decreased by {:.1f}%'.format(100 * (start_mem - end_mem) / start_mem))
     return df
 
-# ----------------- 加载和预处理数据 -----------------
 if TRAINING:
     if os.path.getsize(TRAIN_PATH) > 0:
         df = pd.read_parquet(TRAIN_PATH)
@@ -82,7 +79,6 @@ if TRAINING:
         valid_dates = remaining_dates[-NUM_VALID_DATES:] if NUM_VALID_DATES > 0 else []
         train_dates = remaining_dates[:-NUM_VALID_DATES] if NUM_VALID_DATES > 0 else remaining_dates
 
-        # 处理 symbol_id
         symbol_ids = df['symbol_id'].unique()
         symbol_id_to_index = {symbol_id: idx for idx, symbol_id in enumerate(symbol_ids)}
         df['symbol_id'] = df['symbol_id'].map(symbol_id_to_index)
@@ -93,13 +89,11 @@ if TRAINING:
         print(f"训练文件 '{TRAIN_PATH}' 为空。请提供有效的训练数据集。")
         exit()
 
-# ----------------- 定义加权 R² 评分函数 -----------------
 def weighted_r2_score(y_true, y_pred, weights):
     numerator = np.sum(weights * (y_true - y_pred) ** 2)
     denominator = np.sum(weights * (y_true - np.average(y_true, weights=weights)) ** 2)
     return 1 - (numerator / denominator)
 
-# ----------------- 序列生成函数 -----------------
 def create_sequences_with_padding(df, feature_names, sequence_length, symbol_id_to_index):
     @numba.njit(parallel=True, fastmath=True)
     def build_sequences_numba(group_features, sequence_length):
@@ -200,7 +194,7 @@ def mutate_and_clip(individual, eta=20.0, indpb=1.0):
     clip_individual(individual)
     return (individual,)
 
-# ----------------- 定义 GRU 模型包装类 -----------------
+# 定义 GRU 模型类和包装类，并在fit中使用sample_weight
 class GRU_Model(nn.Module):
     def __init__(self, d_feat=79, hidden_size=64, num_layers=2, dropout=0.0, device='cuda'):
         super(GRU_Model, self).__init__()
@@ -216,8 +210,7 @@ class GRU_Model(nn.Module):
         self.to(self.device)
 
     def forward(self, x):
-        # x: [N, T, F]
-        out, _ = self.rnn(x)
+        out, _ = self.rnn(x) # x: [N,T,F]
         return self.fc_out(out[:, -1, :]).squeeze()
 
 class GRUWrapper:
@@ -235,6 +228,9 @@ class GRUWrapper:
     def fit(self, X_train, y_train, symbol_id_train, sample_weight=None, X_valid=None, y_valid=None, symbol_id_valid=None):
         X_train = np.nan_to_num(X_train, nan=3.0)
         y_train = np.nan_to_num(y_train, nan=3.0)
+        if sample_weight is None:
+            sample_weight = np.ones_like(y_train)
+
         if X_valid is not None and y_valid is not None:
             X_valid = np.nan_to_num(X_valid, nan=3.0)
             y_valid = np.nan_to_num(y_valid, nan=3.0)
@@ -243,23 +239,23 @@ class GRUWrapper:
             torch.tensor(X_train, dtype=torch.float32),
             torch.tensor(y_train, dtype=torch.float32),
             torch.tensor(symbol_id_train, dtype=torch.long),
-            torch.tensor(sample_weight if sample_weight is not None else np.ones(len(y_train)), dtype=torch.float32)
+            torch.tensor(sample_weight, dtype=torch.float32)
         )
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        self.model.train()
         best_loss = float('inf')
         no_improve_epochs = 0
         best_param = copy.deepcopy(self.model.state_dict())
 
         for epoch in tqdm(range(self.epochs), desc='GRU Training Epochs'):
             epoch_loss = 0.0
+            self.model.train()
             for X_batch, y_batch, symbol_batch, w_batch in tqdm(dataloader, desc=f"Epoch {epoch + 1}/{self.epochs}", leave=False):
                 X_batch = X_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
                 w_batch = w_batch.to(self.device)
-                self.optimizer.zero_grad()
 
+                self.optimizer.zero_grad()
                 predictions = self.model(X_batch)
                 loss = self.loss_fn(predictions, y_batch)
                 weighted_loss = (loss * w_batch).mean()
@@ -289,8 +285,6 @@ class GRUWrapper:
                 if no_improve_epochs >= self.patience:
                     print(f"Early stopping at epoch {epoch + 1}, best validation loss: {best_loss:.4f}")
                     break
-
-                self.model.train()
 
         if X_valid is not None and y_valid is not None:
             self.model.load_state_dict(best_param)
@@ -360,7 +354,7 @@ def train(model_dict, model_name='lgb'):
                         early_stopping_rounds=200, verbose=10
                     )
             elif model_name == 'gru':
-                # 使用 GRU 模型序列直接fit
+                # GRU 模型训练考虑 sample_weight
                 self_model = model
                 self_model.fit(
                     X_train, y_train, symbol_id_train, sample_weight=w_train,
@@ -425,7 +419,7 @@ def optimize_weights_genetic_algorithm(fold_predictions, y_true, w_true, populat
 
     toolbox.register("evaluate", eval_weights)
     toolbox.register("mate", mate_and_clip, alpha=0.5)
-    toolbox.register("mutate", mutate_and_clip, eta=20.0, indpb=1.0 / num_models)
+    toolbox.register("mutate", mutate_and_clip, eta=20.0, indpb=1.0)
     toolbox.register("select", tools.selTournament, tournsize=3)
 
     pop = toolbox.population(n=population_size)
@@ -475,7 +469,6 @@ model_dict = {
     ),
 }
 
-# ----------------- 训练和测试流程 -----------------
 models = []
 for model_name in model_dict.keys():
     train(model_dict, model_name)

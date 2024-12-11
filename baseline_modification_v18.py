@@ -26,7 +26,6 @@ os.makedirs(ROOT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(MODEL_PATH, exist_ok=True)
 
-# 全局常量
 TRAINING = True
 FEATURE_NAMES_XLSTM = [f"feature_{i:02d}" for i in range(79)]
 FEATURE_NAMES_OTHER = [f"feature_{i:02d}" for i in range(79)] + ['symbol_id']
@@ -68,7 +67,6 @@ def reduce_mem_usage(df, float16_as32=True):
     print('Decreased by {:.1f}%'.format(100 * (start_mem - end_mem) / start_mem))
     return df
 
-# ----------------- 加载和预处理数据 -----------------
 if TRAINING:
     if os.path.getsize(TRAIN_PATH) > 0:
         df = pd.read_parquet(TRAIN_PATH)
@@ -77,11 +75,9 @@ if TRAINING:
         dates = df['date_id'].unique()
         test_dates = dates[-NUM_TEST_DATES:]
         remaining_dates = dates[:-NUM_TEST_DATES]
-
         valid_dates = remaining_dates[-NUM_VALID_DATES:] if NUM_VALID_DATES > 0 else []
         train_dates = remaining_dates[:-NUM_VALID_DATES] if NUM_VALID_DATES > 0 else remaining_dates
 
-        # 处理 symbol_id
         symbol_ids = df['symbol_id'].unique()
         symbol_id_to_index = {symbol_id: idx for idx, symbol_id in enumerate(symbol_ids)}
         df['symbol_id'] = df['symbol_id'].map(symbol_id_to_index)
@@ -92,13 +88,11 @@ if TRAINING:
         print(f"训练文件 '{TRAIN_PATH}' 为空。请提供有效的训练数据集。")
         exit()
 
-# ----------------- 定义加权 R² 评分函数 -----------------
 def weighted_r2_score(y_true, y_pred, weights):
     numerator = np.sum(weights * (y_true - y_pred) ** 2)
     denominator = np.sum(weights * (y_true - np.average(y_true, weights=weights)) ** 2)
     return 1 - (numerator / denominator)
 
-# ----------------- 序列生成函数 -----------------
 def create_sequences_with_padding(df, feature_names, sequence_length, symbol_id_to_index):
     @numba.njit(parallel=True, fastmath=True)
     def build_sequences_numba(group_features, sequence_length):
@@ -115,7 +109,6 @@ def create_sequences_with_padding(df, feature_names, sequence_length, symbol_id_
         group_targets = group['responder_6'].values
         group_weights = group['weight'].values
         n = len(group_features)
-
         if n == 0:
             return [], [], [], []
 
@@ -199,7 +192,7 @@ def mutate_and_clip(individual, eta=20.0, indpb=1.0):
     clip_individual(individual)
     return (individual,)
 
-# ----------------- 定义GAT模型 -----------------
+# ----------------- 定义GAT模型，并在fit中使用sample_weight -----------------
 class GATModel(nn.Module):
     def __init__(self, d_feat=79, hidden_size=64, num_layers=2, dropout=0.0, base_model="GRU"):
         super().__init__()
@@ -250,7 +243,6 @@ class GATModel(nn.Module):
     def forward(self, x):
         # x: [N, T, F]
         out, _ = self.rnn(x)
-        # 取最后时刻的隐层状态
         hidden = out[:, -1, :]  # [N, hidden_size]
         att_weight = self.cal_attention(hidden, hidden)  # [N, N]
         hidden = att_weight.mm(hidden) + hidden
@@ -274,6 +266,8 @@ class GATsWrapper:
     def fit(self, X_train, y_train, symbol_id_train, sample_weight=None, X_valid=None, y_valid=None, symbol_id_valid=None):
         X_train = np.nan_to_num(X_train, nan=3.0)
         y_train = np.nan_to_num(y_train, nan=3.0)
+        if sample_weight is None:
+            sample_weight = np.ones_like(y_train)
         if X_valid is not None and y_valid is not None:
             X_valid = np.nan_to_num(X_valid, nan=3.0)
             y_valid = np.nan_to_num(y_valid, nan=3.0)
@@ -282,7 +276,7 @@ class GATsWrapper:
             torch.tensor(X_train, dtype=torch.float32),
             torch.tensor(y_train, dtype=torch.float32),
             torch.tensor(symbol_id_train, dtype=torch.long),
-            torch.tensor(sample_weight if sample_weight is not None else np.ones(len(y_train)), dtype=torch.float32)
+            torch.tensor(sample_weight, dtype=torch.float32)
         )
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
@@ -293,6 +287,7 @@ class GATsWrapper:
 
         for epoch in tqdm(range(self.epochs), desc='GATs Training Epochs'):
             epoch_loss = 0.0
+            self.model.train()
             for X_batch, y_batch, symbol_batch, w_batch in tqdm(dataloader, desc=f"Epoch {epoch + 1}/{self.epochs}", leave=False):
                 X_batch = X_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
@@ -328,8 +323,6 @@ class GATsWrapper:
                 if no_improve_epochs >= self.patience:
                     print(f"Early stopping at epoch {epoch + 1}, best validation loss: {best_loss:.4f}")
                     break
-
-                self.model.train()
 
         if X_valid is not None and y_valid is not None:
             self.model.load_state_dict(best_param)
@@ -399,7 +392,7 @@ def train(model_dict, model_name='lgb'):
                         early_stopping_rounds=200, verbose=10
                     )
             elif model_name == 'gats':
-                # 使用 GATs 模型序列直接fit
+                # 使用 GATs 模型序列直接fit，并考虑sample_weight
                 self_model = model
                 self_model.fit(
                     X_train, y_train, symbol_id_train, sample_weight=w_train,
@@ -438,50 +431,48 @@ def ensemble_predictions(weights, fold_predictions):
         avg_pred = np.mean(preds, axis=0)
         avg_pred = avg_pred.squeeze()
         if y_pred is None:
-            y_pred = weights[idx] * avg_pred
+            y_pred = weights[idx]*avg_pred
         else:
-            y_pred += weights[idx] * avg_pred
+            y_pred += weights[idx]*avg_pred
     return y_pred
 
 def optimize_weights_genetic_algorithm(fold_predictions, y_true, w_true, population_size=50, generations=50):
-    model_names = list(fold_predictions.keys())
-    num_models = len(model_names)
-
+    model_names=list(fold_predictions.keys())
+    num_models=len(model_names)
     creator.create("FitnessMax", base.Fitness, weights=(1.0,))
     creator.create("Individual", list, fitness=creator.FitnessMax)
-    toolbox = base.Toolbox()
-
-    toolbox.register("attr_float", random.uniform, 0.0, 1.0)
-    toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_float, n=num_models)
-    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    toolbox=base.Toolbox()
+    toolbox.register("attr_float",random.uniform,0.0,1.0)
+    toolbox.register("individual",tools.initRepeat,creator.Individual,toolbox.attr_float,n=num_models)
+    toolbox.register("population",tools.initRepeat,list,toolbox.individual)
 
     def eval_weights(individual):
-        weights = np.array(individual)
-        weights /= weights.sum()
+        weights=np.array(individual)
+        weights/=weights.sum()
         y_pred = ensemble_predictions(weights, fold_predictions)
-        score = weighted_r2_score(y_true, y_pred, w_true)
+        score=weighted_r2_score(y_true,y_pred,w_true)
         return (score,)
 
-    toolbox.register("evaluate", eval_weights)
+    toolbox.register("evaluate",eval_weights)
     toolbox.register("mate", mate_and_clip, alpha=0.5)
-    toolbox.register("mutate", mutate_and_clip, eta=20.0, indpb=1.0 / num_models)
+    toolbox.register("mutate", mutate_and_clip, eta=20.0, indpb=1.0)
     toolbox.register("select", tools.selTournament, tournsize=3)
 
-    pop = toolbox.population(n=population_size)
-    stats = tools.Statistics(lambda ind: ind.fitness.values)
-    stats.register("max", np.max)
-    stats.register("avg", np.mean)
+    pop=toolbox.population(n=population_size)
+    stats=tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("max",np.max)
+    stats.register("avg",np.mean)
 
-    pop, logbook = algorithms.eaSimple(pop, toolbox, cxpb=0.7, mutpb=0.2, ngen=generations, stats=stats, verbose=False)
-    top_individuals = tools.selBest(pop, k=1)
-    best_weights = np.array(top_individuals[0])
-    best_weights /= best_weights.sum()
-    best_score = top_individuals[0].fitness.values[0]
+    pop, logbook= algorithms.eaSimple(pop,toolbox,cxpb=0.7,mutpb=0.2,ngen=generations,stats=stats,verbose=False)
+    top_individuals=tools.selBest(pop,k=1)
+    best_weights=np.array(top_individuals[0])
+    best_weights/=best_weights.sum()
+    best_score=top_individuals[0].fitness.values[0]
 
     del creator.FitnessMax
     del creator.Individual
 
-    return best_weights, best_score
+    return best_weights,best_score
 
 # ----------------- 模型字典定义 -----------------
 model_dict = {
@@ -515,7 +506,6 @@ model_dict = {
     ),
 }
 
-# ----------------- 训练和测试流程 -----------------
 models = []
 for model_name in model_dict.keys():
     train(model_dict, model_name)
@@ -526,22 +516,22 @@ if TRAINING:
     test_df = df[df['date_id'].isin(test_dates)]
     model_names = list(model_dict.keys())
     fold_predictions, y_test, w_test = get_fold_predictions(
-        model_names, test_df, FEATURE_NAMES_XLSTM, FEATURE_NAMES_OTHER, symbol_id_to_index, SEQUENCE_LENGTH
+        model_names,test_df,FEATURE_NAMES_XLSTM,FEATURE_NAMES_OTHER,symbol_id_to_index,SEQUENCE_LENGTH
     )
 
-    sample_counts = {model_name: [pred.shape[0] for pred in preds] for model_name, preds in fold_predictions.items()}
+    sample_counts = {model_name:[pred.shape[0] for pred in preds] for model_name,preds in fold_predictions.items()}
     print("各模型预测样本数量：", sample_counts)
     counts = [preds[0].shape[0] for preds in fold_predictions.values()]
     if not all(count == counts[0] for count in counts):
         raise ValueError("不同模型的预测样本数量不一致。")
 
-    optimized_weights, ensemble_r2_score = optimize_weights_genetic_algorithm(fold_predictions, y_test, w_test)
+    optimized_weights, ensemble_r2_score = optimize_weights_genetic_algorithm(fold_predictions,y_test,w_test)
 
     model_scores = {}
     for model_name in model_names:
         avg_pred = np.mean(fold_predictions[model_name], axis=0)
         model_scores[model_name] = weighted_r2_score(y_test, avg_pred, w_test)
-    print(f"最优模型权重: {dict(zip(model_names, optimized_weights))}")
+    print(f"最优模型权重: {dict(zip(model_names,optimized_weights))}")
 
     y_ensemble_pred = ensemble_predictions(optimized_weights, fold_predictions)
     ensemble_r2_score = weighted_r2_score(y_test, y_ensemble_pred, w_test)

@@ -92,13 +92,11 @@ if TRAINING:
         print(f"训练文件 '{TRAIN_PATH}' 为空。请提供有效的训练数据集。")
         exit()
 
-# ----------------- 定义加权 R² 评分函数 -----------------
 def weighted_r2_score(y_true, y_pred, weights):
     numerator = np.sum(weights * (y_true - y_pred) ** 2)
     denominator = np.sum(weights * (y_true - np.average(y_true, weights=weights)) ** 2)
     return 1 - (numerator / denominator)
 
-# ----------------- 序列生成函数 -----------------
 def create_sequences_with_padding(df, feature_names, sequence_length, symbol_id_to_index):
     @numba.njit(parallel=True, fastmath=True)
     def build_sequences_numba(group_features, sequence_length):
@@ -199,7 +197,7 @@ def mutate_and_clip(individual, eta=20.0, indpb=1.0):
     clip_individual(individual)
     return (individual,)
 
-# ----------------- Sandwich 模型定义（不从别的地方import） -----------------
+# ----------------- 定义 Sandwich 模型并加入sample_weight逻辑 -----------------
 class CNNEncoderBase(nn.Module):
     def __init__(self, input_dim, output_dim, kernel_size, device):
         super().__init__()
@@ -210,9 +208,7 @@ class CNNEncoderBase(nn.Module):
         self.conv = nn.Conv1d(input_dim, output_dim, kernel_size, padding=(kernel_size - 1) // 2)
 
     def forward(self, x):
-        # x: [N, 1, T, F], 首先转换为 [N,T,F], 再转 [N,F,T] 来卷积
         N, node_num, T, F = x.shape
-        # 暂时假设node_num=1
         x = x[:,0,:,:]  # [N,T,F]
         x = x.permute(0,2,1).to(self.device) # [N,F,T]
         y = self.conv(x)  # [N,output_dim,T]
@@ -233,7 +229,6 @@ class KRNNEncoderBase(nn.Module):
             self.rnn_modules.append(nn.GRU(input_dim, output_dim, num_layers=self.rnn_layers, dropout=dropout))
 
     def forward(self, x):
-        # x: [N,T,dim]
         N, T, dim = x.shape
         x = x.permute(1,0,2).to(self.device) # [T,N,dim]
 
@@ -305,7 +300,6 @@ class SandwichModel(nn.Module):
         out = self.out_fc(encode[:, -1, :]).squeeze().to(self.device)
         return out
 
-# ----------------- Sandwich 模型包装类 -----------------
 class SandwichWrapper:
     def __init__(self,
                  input_dim,
@@ -353,6 +347,9 @@ class SandwichWrapper:
         y_train = np.nan_to_num(y_train, nan=3.0)
         X_train_4d = X_train[:, np.newaxis, :, :]  # [N,1,T,F]
 
+        if sample_weight is None:
+            sample_weight = np.ones_like(y_train)
+
         if X_valid is not None and y_valid is not None:
             X_valid = np.nan_to_num(X_valid, nan=3.0)
             y_valid = np.nan_to_num(y_valid, nan=3.0)
@@ -362,7 +359,7 @@ class SandwichWrapper:
             torch.tensor(X_train_4d, dtype=torch.float32),
             torch.tensor(y_train, dtype=torch.float32),
             torch.tensor(symbol_id_train, dtype=torch.long),
-            torch.tensor(sample_weight if sample_weight is not None else np.ones(len(y_train)), dtype=torch.float32)
+            torch.tensor(sample_weight, dtype=torch.float32)
         )
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
@@ -395,6 +392,7 @@ class SandwichWrapper:
                     X_valid_4d_t = torch.tensor(X_valid_4d, dtype=torch.float32).to(self.device)
                     y_valid_t = torch.tensor(y_valid, dtype=torch.float32).to(self.device)
                     valid_predictions = self.model(X_valid_4d_t)
+                    # 验证集没有sample_weight时假设为1
                     valid_loss = torch.nn.functional.mse_loss(valid_predictions, y_valid_t, reduction='mean').item()
 
                 print(f"Sandwich Epoch {epoch + 1}/{self.epochs}, Validation Loss: {valid_loss:.4f}")
@@ -479,7 +477,7 @@ def train(model_dict, model_name='lgb'):
                         early_stopping_rounds=200, verbose=10
                     )
             elif model_name == 'sandwich':
-                # 使用 Sandwich模型序列直接fit
+                # Sandwich模型现在也使用sample_weight
                 self_model = model
                 self_model.fit(
                     X_train, y_train, symbol_id_train, sample_weight=w_train,
@@ -563,7 +561,6 @@ def optimize_weights_genetic_algorithm(fold_predictions, y_true, w_true, populat
 
     return best_weights, best_score
 
-# ----------------- 模型字典定义 -----------------
 model_dict = {
     'sandwich': SandwichWrapper(
         input_dim=len(FEATURE_NAMES_XLSTM),
@@ -599,7 +596,6 @@ model_dict = {
     ),
 }
 
-# ----------------- 训练和测试流程 -----------------
 models = []
 for model_name in model_dict.keys():
     train(model_dict, model_name)

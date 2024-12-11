@@ -14,7 +14,8 @@ from joblib import Parallel, delayed
 import numba
 import multiprocessing
 from tqdm import tqdm
-
+import torch.nn as nn
+import torch.nn.init as init
 
 # ----------------- 文件路径和参数 -----------------
 ROOT_DIR = r'C:\Users\cyg19\Desktop\kaggle_test'
@@ -26,7 +27,6 @@ os.makedirs(ROOT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(MODEL_PATH, exist_ok=True)
 
-# 全局常量
 TRAINING = True
 FEATURE_NAMES_XLSTM = [f"feature_{i:02d}" for i in range(79)]
 FEATURE_NAMES_OTHER = [f"feature_{i:02d}" for i in range(79)] + ['symbol_id']
@@ -35,7 +35,6 @@ NUM_TEST_DATES = 90
 SKIP_DATES = 500
 N_FOLD = 5
 SEQUENCE_LENGTH = 5
-
 
 def reduce_mem_usage(df, float16_as32=True):
     start_mem = df.memory_usage().sum() / 1024**2
@@ -69,7 +68,6 @@ def reduce_mem_usage(df, float16_as32=True):
     print('Decreased by {:.1f}%'.format(100 * (start_mem - end_mem) / start_mem))
     return df
 
-# ----------------- 加载和预处理数据 -----------------
 if TRAINING:
     if os.path.getsize(TRAIN_PATH) > 0:
         df = pd.read_parquet(TRAIN_PATH)
@@ -82,7 +80,6 @@ if TRAINING:
         valid_dates = remaining_dates[-NUM_VALID_DATES:] if NUM_VALID_DATES > 0 else []
         train_dates = remaining_dates[:-NUM_VALID_DATES] if NUM_VALID_DATES > 0 else remaining_dates
 
-        # 处理 symbol_id
         symbol_ids = df['symbol_id'].unique()
         symbol_id_to_index = {symbol_id: idx for idx, symbol_id in enumerate(symbol_ids)}
         df['symbol_id'] = df['symbol_id'].map(symbol_id_to_index)
@@ -93,13 +90,11 @@ if TRAINING:
         print(f"训练文件 '{TRAIN_PATH}' 为空。请提供有效的训练数据集。")
         exit()
 
-# ----------------- 定义加权 R² 评分函数 -----------------
 def weighted_r2_score(y_true, y_pred, weights):
     numerator = np.sum(weights * (y_true - y_pred) ** 2)
     denominator = np.sum(weights * (y_true - np.average(y_true, weights=weights)) ** 2)
     return 1 - (numerator / denominator)
 
-# ----------------- 序列生成函数 -----------------
 def create_sequences_with_padding(df, feature_names, sequence_length, symbol_id_to_index):
     @numba.njit(parallel=True, fastmath=True)
     def build_sequences_numba(group_features, sequence_length):
@@ -150,11 +145,8 @@ def create_sequences_with_padding(df, feature_names, sequence_length, symbol_id_
 
         return sequences, targets, weights, symbol_ids_seq
 
-    # 将 groupby 结果转换为列表，便于tqdm显示进度
     grouped_items = list(df.groupby('symbol_id'))
     num_cores = multiprocessing.cpu_count() - 1
-
-    # 使用tqdm显示进度条
     results = Parallel(n_jobs=num_cores)(
         delayed(process_group)(symbol_id, group, feature_names, sequence_length, symbol_id_to_index)
         for symbol_id, group in tqdm(grouped_items, desc='Processing sequences')
@@ -182,9 +174,8 @@ def create_sequences_with_padding(df, feature_names, sequence_length, symbol_id_
         y = np.empty((0,))
         w = np.empty((0,))
         symbol_ids_seq = np.empty((0,), dtype=int)
-
     return X, y, w, symbol_ids_seq
-# ----------------- 优化权重（使用遗传算法）的辅助函数 -----------------
+
 def clip_individual(individual, min_val=0.0, max_val=1.0):
     for i in range(len(individual)):
         if individual[i] < min_val:
@@ -202,10 +193,6 @@ def mutate_and_clip(individual, eta=20.0, indpb=1.0):
     tools.mutPolynomialBounded(individual, eta=eta, low=0.0, up=1.0, indpb=indpb)
     clip_individual(individual)
     return (individual,)
-
-# ----------------- 替换 LNN 模型为 SFM 模型 -----------------
-import torch.nn as nn
-import torch.nn.init as init
 
 class SFM_Model(nn.Module):
     def __init__(
@@ -366,8 +353,6 @@ class SFMWrapper:
 
         for epoch in range(self.epochs):
             epoch_loss = 0.0
-
-            # 使用tqdm包裹dataloader，显示batch处理进度
             for X_batch, y_batch, symbol_batch, w_batch in tqdm(dataloader, desc=f"Training Epoch {epoch+1}/{self.epochs}", leave=False):
                 X_batch = X_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
@@ -418,7 +403,6 @@ class SFMWrapper:
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
-# ----------------- 模型训练函数 -----------------
 def train(model_dict, model_name='lgb'):
     for i in range(N_FOLD):
         if TRAINING:
@@ -470,7 +454,6 @@ def train(model_dict, model_name='lgb'):
                         early_stopping_rounds=200, verbose=10
                     )
             elif model_name == 'sfm':
-                # SFM模型是序列模型，直接使用原来的X_train, y_train等
                 self_model = model
                 self_model.fit(
                     X_train, y_train, symbol_id_train, sample_weight=w_train,
@@ -480,7 +463,6 @@ def train(model_dict, model_name='lgb'):
             joblib.dump(model, os.path.join(MODEL_DIR, f'{model_name}_{i}.model'))
             del X_train, y_train, w_train, symbol_id_train, X_valid, y_valid, w_valid, symbol_id_valid
 
-# ----------------- 收集模型的各折预测 -----------------
 def get_fold_predictions(model_names, test_df, feature_names_xlstm, feature_names_other, symbol_id_to_index, sequence_length):
     fold_predictions = {model_name: [] for model_name in model_names}
     X_test_xlstm, y_test, w_test, symbol_id_test = create_sequences_with_padding(
@@ -554,7 +536,6 @@ def optimize_weights_genetic_algorithm(fold_predictions, y_true, w_true, populat
 
     return best_weights, best_score
 
-# ----------------- 模型字典定义 -----------------
 model_dict = {
     'sfm': SFMWrapper(
         input_dim=len(FEATURE_NAMES_XLSTM),
@@ -584,7 +565,6 @@ model_dict = {
     ),
 }
 
-# ----------------- 训练和测试流程 -----------------
 models = []
 for model_name in model_dict.keys():
     train(model_dict, model_name)
