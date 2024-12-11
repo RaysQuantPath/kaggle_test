@@ -415,9 +415,50 @@ def train(model_dict, model_name='lgb'):
 
                 model = model_dict[model_name]
                 model.fit(X_train, y_train, symbol_id_train, X_valid, y_valid, symbol_id_valid, sample_weight=w_train)
-            else:
-                # 其他模型逻辑（略）
-                pass
+            elif model_name in ['lgb', 'xgb', 'cbt']:
+                X_train, y_train, w_train, symbol_id_train = create_sequences_with_padding(
+                    train_df, FEATURE_NAMES_TCN, SEQUENCE_LENGTH, symbol_id_to_index
+                )
+                if NUM_VALID_DATES > 0:
+                    X_valid, y_valid, w_valid, symbol_id_valid = create_sequences_with_padding(
+                        valid_df, FEATURE_NAMES_TCN, SEQUENCE_LENGTH, symbol_id_to_index
+                    )
+                else:
+                    X_valid, y_valid, w_valid, symbol_id_valid = None, None, None, None
+
+                # 对于非序列模型，使用序列的最后一个时间步的特征加 symbol_id
+                X_train_last = X_train[:, -1, :]  # (num_samples, 79)
+                X_train_other = np.hstack((X_train_last, symbol_id_train.reshape(-1, 1)))  # (num_samples, 80)
+
+                if X_valid is not None:
+                    X_valid_last = X_valid[:, -1, :]  # (num_valid_samples, 79)
+                    X_valid_other = np.hstack((X_valid_last, symbol_id_valid.reshape(-1, 1)))  # (num_valid_samples, 80)
+                else:
+                    X_valid_other = None
+
+                model = model_dict[model_name]
+                if model_name == 'lgb':
+                    model.fit(
+                        X_train_other, y_train, sample_weight=w_train,
+                        eval_set=[(X_valid_other, y_valid)] if NUM_VALID_DATES > 0 else None,
+                        callbacks=[lgb.early_stopping(200), lgb.log_evaluation(10)] if NUM_VALID_DATES > 0 else None
+                    )
+                elif model_name == 'cbt':
+                    if NUM_VALID_DATES > 0:
+                        evalset = cbt.Pool(X_valid_other, y_valid, weight=w_valid)
+                        model.fit(
+                            X_train_other, y_train, sample_weight=w_train,
+                            eval_set=[evalset], early_stopping_rounds=200, verbose=10
+                        )
+                    else:
+                        model.fit(X_train_other, y_train, sample_weight=w_train)
+                elif model_name == 'xgb':
+                    model.fit(
+                        X_train_other, y_train, sample_weight=w_train,
+                        eval_set=[(X_valid_other, y_valid)] if NUM_VALID_DATES > 0 else None,
+                        sample_weight_eval_set=[w_valid] if NUM_VALID_DATES > 0 else None,
+                        early_stopping_rounds=200, verbose=10
+                    )
 
             joblib.dump(model, os.path.join(MODEL_DIR, f'{model_name}_{i}.model'))
             del X_train, y_train, w_train, X_valid, y_valid, w_valid, symbol_id_train, symbol_id_valid
