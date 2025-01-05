@@ -7,7 +7,7 @@ import math
 import numpy as np
 import pandas as pd
 import random
-from catboost import CatBoostRegressor
+from xgboost import XGBRegressor
 from numba import njit, prange  # 导入Numba
 
 ##############################################################################
@@ -26,7 +26,6 @@ ORTH_LAMBDA = 0.05
 
 FEATURE_CSV_PATH = '/well/ludwig/users/mil024/YY/features.csv'  # 如果要用标签相似度
 USE_MULTI_GPU_DEVICES = '0,1,2,3'  # 可改为 '0,1,2,3,4' 等
-
 
 ##############################################################################
 # ------------------- 内存优化 -----------------------------------------------
@@ -63,26 +62,35 @@ def reduce_mem_usage(df, float16_as32=True):
                         df[col] = df[col].astype(np.float32)
                     else:
                         df[col] = df[col].astype(np.float64)
-    end_mem = df.memory_usage().sum() / 1024**2
+    end_mem = df.memory_usage().sum()/1024**2
     print(f"Memory usage after optimization is {end_mem:.2f} MB")
-    print(f"Decreased by {(100*(start_mem - end_mem)/start_mem):.1f}%")
+    print(f"Decreased by {(100*(start_mem-end_mem)/start_mem):.1f}%")
     return df
-
 
 ##############################################################################
 # ------------------- (可选) 标签相似度 --------------------------------------
 ##############################################################################
-def compute_tag_similarity_matrix(tag_df):
-    feats = tag_df.index.tolist()
-    arr = tag_df.astype(int).values
+
+@njit(parallel=True)
+def compute_tag_similarity_matrix_numba(feats, arr):
+    num_feats = len(feats)
     sim_matrix = {}
-    for i, f1 in enumerate(feats):
+    for i in prange(num_feats):
+        f1 = feats[i]
         sim_matrix[f1] = {}
-        for j, f2 in enumerate(feats):
-            overlap = np.sum(arr[i] & arr[j])
+        for j in range(num_feats):
+            f2 = feats[j]
+            overlap = 0
+            for k in range(arr.shape[1]):
+                overlap += arr[i][k] & arr[j][k]
             sim_matrix[f1][f2] = float(overlap)
     return sim_matrix
 
+def compute_tag_similarity_matrix(tag_df):
+    feats = tag_df.index.tolist()
+    arr = tag_df.astype(int).values
+    sim_matrix = compute_tag_similarity_matrix_numba(feats, arr)
+    return sim_matrix
 
 ##############################################################################
 # ---------------- OperatorTree & evaluate_operator_tree ---------------------
@@ -95,7 +103,6 @@ class OperatorTree:
 
     def __repr__(self):
         return f"OpTree(op={self.operator}, depth={self.depth}, kids={self.children})"
-
 
 def evaluate_operator_tree(tree, df):
     op = tree.operator
@@ -110,7 +117,7 @@ def evaluate_operator_tree(tree, df):
             child_vals.append(df[c].values)
         else:
             raise ValueError("Unknown child in operator_tree.")
-    if op in ['+', '-', '*', '/']:
+    if op in ['+','-','*','/']:
         if len(child_vals) != 2:
             raise ValueError(f"Binary {op} => need 2 children.")
         c1, c2 = child_vals
@@ -121,14 +128,14 @@ def evaluate_operator_tree(tree, df):
         elif op == '*':
             return c1 * c2
         elif op == '/':
-            return np.where(np.abs(c2) < 1e-9, 0, c1 / (c2 + 1e-9))
+            return np.where(np.abs(c2) < 1e-9, 0, c1/(c2+1e-9))
     else:
         # unary
         if len(child_vals) != 1:
             raise ValueError(f"Unary {op} => 1 child.")
         c = child_vals[0]
         if op == 'log':
-            return np.log(np.abs(c) + 1e-9)
+            return np.log(np.abs(c)+1e-9)
         elif op == 'exp':
             return np.exp(c)
         elif op == 'sqrt':
@@ -138,16 +145,15 @@ def evaluate_operator_tree(tree, df):
         else:
             raise NotImplementedError(f"Unsupported operator {op}")
 
-
 ##############################################################################
-# ---------------- Weighted R² + CV + CatBoost -------------------------------
+# ---------------- Weighted R² + CV + (XGBoost) ------------------------------
 ##############################################################################
 def weighted_r2_score(y_true, y_pred, w):
-    numerator = np.sum(w * (y_true - y_pred) ** 2)
-    denominator = np.sum(w * (y_true ** 2)) + 1e-15
-    return 1 - numerator / denominator
+    numerator = np.sum(w*(y_true-y_pred)**2)
+    denominator = np.sum(w*(y_true**2)) + 1e-15
+    return 1 - numerator/denominator
 
-def evaluate_with_cv(X, y, w, model_fn, n_splits=5, random_state=42):
+def evaluate_with_cv(X, y, w, model_fn, n_splits=4, random_state=42):
     from sklearn.model_selection import KFold
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     scores = []
@@ -156,22 +162,34 @@ def evaluate_with_cv(X, y, w, model_fn, n_splits=5, random_state=42):
         y_train, y_val = y[train_idx], y[val_idx]
         w_train, w_val = w[train_idx], w[val_idx]
         model = model_fn()
-        model.fit(X_train, y_train, sample_weight=w_train,
-                  eval_set=(X_val, y_val), use_best_model=False, verbose=False)
+        # ----------------- 保持原有 fit() 调用结构，不额外改动 -----------------
+        model.fit(X_train, y_train,
+                  sample_weight=w_train,
+                  eval_set=[(X_val, y_val)],
+                  early_stopping_rounds=100,
+                  verbose=False)
         y_pred = model.predict(X_val)
         sc = weighted_r2_score(y_val, y_pred, w_val)
         scores.append(sc)
     return np.mean(scores)
 
+# ----------------- 改动 2：这里改用 XGBoost 替换 CatBoost -----------------
 def default_model_fn():
-    return CatBoostRegressor(
-        iterations=500,
-        depth=6,
-        learning_rate=0.01,
-        task_type='GPU',
-        devices=USE_MULTI_GPU_DEVICES,  # 多GPU
-        verbose=0,
-        early_stopping_rounds=100
+    return XGBRegressor(
+        n_estimators=500,
+        max_depth=5,
+        learning_rate=0.001,
+        tree_method='hist',        # 使用直方图加速
+        objective='reg:squarederror',
+        device = "cuda",                # 多GPU
+        # ---------------- 可添加更多超参数 ----------------
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.09,
+        reg_lambda=0.07,
+        gamma=4,
+        n_jobs=-1,
+        min_child_weight=7
     )
 
 @njit(parallel=True)
@@ -196,15 +214,25 @@ def compute_orthogonality_penalty(new_col, X_existing, orth_lambda=0.05):
     penalty = compute_orthogonality_penalty_numba(new_col, X_existing, orth_lambda, num_features)
     return penalty
 
-
 ##############################################################################
 # ------- 在二元运算时若 use_similarity=True, 用相似度加权“右侧” feature选择 ----
 ##############################################################################
+@njit(parallel=True)
+def compute_pair_similarity_numba(leaves, right_feat, sim_matrix):
+    if len(leaves) == 0:
+        return 1.0
+    total = 0.0
+    count = 0
+    for lf in prange(len(leaves)):
+        leaf = leaves[lf]
+        if leaf in sim_matrix and right_feat in sim_matrix[leaf]:
+            total += sim_matrix[leaf][right_feat]
+            count += 1
+    if count == 0:
+        return 1.0
+    return (total / count + 1.0)
+
 def compute_pair_similarity(left_tree, right_feat, sim_matrix):
-    """
-    计算 left_tree 里所有叶子与 right_feat 之间的 overlap 并取均值 +1.0
-    使相似度越高 => 概率越大
-    """
     leaves = set()
     def dfs(t):
         if t.operator is None and len(t.children) == 1 and isinstance(t.children[0], str):
@@ -216,18 +244,9 @@ def compute_pair_similarity(left_tree, right_feat, sim_matrix):
                 elif isinstance(ch, str):
                     leaves.add(ch)
     dfs(left_tree)
-    if not leaves:
-        return 1.0
-    total = 0.0
-    count = 0
-    for lf in leaves:
-        if lf in sim_matrix and right_feat in sim_matrix[lf]:
-            total += sim_matrix[lf][right_feat]
-            count += 1
-    if count == 0:
-        return 1.0
-    return (total / count + 1.0)
-
+    leaves = list(leaves)  # 转换为列表以便与Numba兼容
+    similarity = compute_pair_similarity_numba(leaves, right_feat, sim_matrix)
+    return similarity
 
 ##############################################################################
 # --------- ActionSpace: 统一管理 (unary_ops, binary_ops, features, finish) --
@@ -268,7 +287,6 @@ class ActionSpace:
     def all_actions(self):
         return list(self.mapping.keys())
 
-
 ##############################################################################
 # ---------------- ExpressionEnv ---------------------------------------------
 ##############################################################################
@@ -279,7 +297,7 @@ class ExpressionEnv:
      - 若 'feature' => create leaf
      - 若 'unary' => wrap current_tree
      - 若 'binary' => merge current_tree with 右子树(特征可按相似度加权采样).
-     - reward= WeightedR²增量 - 正交度
+     - reward = WeightedR²增量 - 正交度
      - depth>=max_depth => done
     """
     def __init__(
@@ -293,7 +311,7 @@ class ExpressionEnv:
         orth_lambda=0.05,
         model_fn= default_model_fn,
         finish_id=999999,
-        n_splits=5,
+        n_splits=4,
         random_state=42,
         sim_matrix=None,
         use_similarity=False
@@ -317,26 +335,26 @@ class ExpressionEnv:
         self.action_space = ActionSpace(unary_ops, binary_ops, feature_list, finish_id)
         self.current_tree = None
         self.depth = 0
-        self.X_current = np.zeros((len(df), 0), dtype=np.float32)
+        self.X_current = np.zeros((len(df),0), dtype=np.float32)
         self.current_score = 0.0
         self.prev_score = 0.0
 
     def clone(self):
         import copy
         new_env = ExpressionEnv(
-            df=self.df,
-            feature_list=self.feature_list,
-            target_col=self.target_col,
-            unary_ops=self.unary_ops,
-            binary_ops=self.binary_ops,
-            max_depth=self.max_depth,
-            orth_lambda=self.orth_lambda,
-            model_fn=self.model_fn,
-            finish_id=self.finish_id,
-            n_splits=self.n_splits,
-            random_state=self.random_state,
-            sim_matrix=self.sim_matrix,
-            use_similarity=self.use_similarity
+            df = self.df,
+            feature_list = self.feature_list,
+            target_col = self.target_col,
+            unary_ops = self.unary_ops,
+            binary_ops = self.binary_ops,
+            max_depth = self.max_depth,
+            orth_lambda = self.orth_lambda,
+            model_fn = self.model_fn,
+            finish_id = self.finish_id,
+            n_splits = self.n_splits,
+            random_state = self.random_state,
+            sim_matrix = self.sim_matrix,
+            use_similarity = self.use_similarity
         )
         new_env.current_tree = copy.deepcopy(self.current_tree)
         new_env.depth = self.depth
@@ -363,13 +381,13 @@ class ExpressionEnv:
         new_tree = None
         if cat == 'feature':
             feat_name = self.feature_list[idx]
-            leaf = OperatorTree(None, [feat_name], depth=self.depth + 1)
+            leaf = OperatorTree(None, [feat_name], depth=self.depth+1)
             if self.current_tree is None:
                 new_tree = leaf
             else:
                 # 默认用 '+'
                 new_tree = OperatorTree('+', [self.current_tree, leaf],
-                                        depth=max(self.current_tree.depth, leaf.depth) + 1)
+                                        depth=max(self.current_tree.depth, leaf.depth)+1)
         elif cat == 'unary':
             op_name = self.unary_ops[idx]
             if self.current_tree is None:
@@ -377,7 +395,7 @@ class ExpressionEnv:
                 new_tree = OperatorTree(op_name, [leaf], depth=2)
             else:
                 new_tree = OperatorTree(op_name, [self.current_tree],
-                                        depth=self.current_tree.depth + 1)
+                                        depth=self.current_tree.depth+1)
         elif cat == 'binary':
             op_name = self.binary_ops[idx]
             # 右侧特征 => 如果 use_similarity 且已有 current_tree => 加权随机
@@ -405,12 +423,12 @@ class ExpressionEnv:
                 # 否则 => uniform pick
                 feat_name = random.choice(self.feature_list)
 
-            leaf = OperatorTree(None, [feat_name], depth=self.depth + 1)
+            leaf = OperatorTree(None, [feat_name], depth=self.depth+1)
             if self.current_tree is None:
                 new_tree = leaf
             else:
                 new_tree = OperatorTree(op_name, [self.current_tree, leaf],
-                                        depth=max(self.current_tree.depth, leaf.depth) + 1)
+                                        depth=max(self.current_tree.depth, leaf.depth)+1)
         else:
             raise ValueError(f"Unknown cat={cat}")
 
@@ -451,7 +469,6 @@ class ExpressionEnv:
                               n_splits=self.n_splits, random_state=self.random_state)
         return sc
 
-
 ##############################################################################
 # ----------------- MCTS Node & pipeline -------------------------------------
 ##############################################################################
@@ -480,12 +497,12 @@ def select_child(node):
     best_a = None
     best_c = None
     best_s = -1e9
-    for a, c in node.children.items():
-        s = ucb_score(node, c)
+    for a, cnode in node.children.items():
+        s = ucb_score(node, cnode)
         if s > best_s:
             best_s = s
             best_a = a
-            best_c = c
+            best_c = cnode
     return best_a, best_c
 
 def expand_node_mcts(node, env):
@@ -500,7 +517,7 @@ def backpropagate(path, val, discount=1.0):
     for nd in reversed(path):
         nd.visit_count += 1
         nd.value_sum += val
-        val = nd.reward + discount * val
+        val = nd.reward + discount*val
 
 def rollout(sim_env, rollout_steps=1):
     total = 0.0
@@ -584,23 +601,22 @@ def train_mcts_feature_engineer(
     final_exprs = []
     for ep in range(num_episodes):
         env = ExpressionEnv(
-            df=df,
-            feature_list=feature_list,
-            target_col=target_col,
-            unary_ops=unary_ops,
-            binary_ops=binary_ops,
-            max_depth=max_depth,
-            finish_id=999999,
-            n_splits=5,
-            random_state=42,
-            sim_matrix=sim_matrix,
-            use_similarity=use_similarity
+            df = df,
+            feature_list = feature_list,
+            target_col = target_col,
+            unary_ops = unary_ops,
+            binary_ops = binary_ops,
+            max_depth = max_depth,
+            finish_id = 999999,
+            n_splits = 4,
+            random_state = 42,
+            sim_matrix = sim_matrix,
+            use_similarity = use_similarity
         )
         ep_reward, ep_steps = mcts_search_expression(env, n_sim=n_sim, max_steps=max_steps_per_episode)
         print(f"Episode {ep+1}/{num_episodes}, reward={ep_reward:.4f}, steps={ep_steps}, final_depth={env.depth}")
         final_exprs.append(env.current_tree)
     return final_exprs
-
 
 ##############################################################################
 # ------------------------------ 主入口 --------------------------------------
@@ -625,12 +641,31 @@ if TRAINING:
         print(f"训练文件 '{TRAIN_PATH}' 不存在或为空, 无法继续.")
         sys.exit(1)
     df_main = pd.read_parquet(TRAIN_PATH)
-    df_main.fillna(-3.0, inplace=True)
+    del df_main['partition_id']
+
+    categorical_features = ['feature_09', 'feature_10', 'feature_11']
+    for feature in categorical_features:
+        df_main[feature] = df_main[feature].astype('category').cat.codes
+
+    # 3.1) 检查并转换所有其他类别类型的列（如果有）
+    other_categorical = df_main.select_dtypes(['category']).columns.tolist()
+    # 移除已经编码的 categorical_features
+    other_categorical = [col for col in other_categorical if col not in categorical_features]
+    for feature in other_categorical:
+        df_main[feature] = df_main[feature].astype('category').cat.codes
+    if other_categorical:
+        print(f"已编码其他类别列: {other_categorical}")
+
+    # 4) 内存优化前，先填充缺失值
+    # 仅对数值型列填充缺失值
+    numeric_cols = df_main.select_dtypes(include=[np.number]).columns
+    df_main[numeric_cols] = df_main[numeric_cols].fillna(-3.0)
+
     df_main = reduce_mem_usage(df_main, float16_as32=False)
 
     # 3) 手动构建 responder_X lag(1)
     lag_cols = [f"responder_{i}" for i in range(9)]
-    df_main.sort_values(['symbol_id', 'date_id', 'time_id'], inplace=True, ignore_index=True)
+    df_main.sort_values(['symbol_id','date_id','time_id'], inplace=True, ignore_index=True)
     for i in range(9):
         base_col = f"responder_{i}"
         new_col = f"responder_{i}_lag_1"
@@ -648,11 +683,11 @@ if TRAINING:
     final_exprs = train_mcts_feature_engineer(
         df_main,
         target_col='responder_6',
-        unary_ops=['log', 'exp', 'sqrt', 'square'],
-        binary_ops=['+', '-', '*', '/'],
+        unary_ops=['log','exp','sqrt','square'],
+        binary_ops=['+','-','*','/'],
         feature_list=None,
         max_depth=5,
-        num_episodes=3,
+        num_episodes=1,
         n_sim=5,
         max_steps_per_episode=5,
         sim_matrix=sim_matrix,
